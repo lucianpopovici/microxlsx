@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microxlsx"
+version = "0.1.0"
+authors = [
+  { name="Lucian Popovici", email="gm.spamisc@gmail.com" },
+]
+description = "A surgical, non-destructive XLSX modifier that preserves Macros and Styles."
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/lucianpopovici/microxlsx"
