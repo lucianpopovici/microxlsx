@@ -1,3 +1,6 @@
+"""
+Utility functions for cell reference conversion.
+"""
 import re
 
 def cell_to_indices(cell_ref):
