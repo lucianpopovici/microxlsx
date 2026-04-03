@@ -23,3 +23,15 @@ Features
    * 📦 Zero Dependencies: Uses only the Python Standard Library.
 
    * 📎 Macro-Friendly: Perfect for updating data in .xlsm templates.
+
+** 🚀 Usage Example
+
+```python
+from microxlsx import XLSXPackage
+
+pkg = XLSXPackage("template.xlsm")
+pkg.update_table_cell("SalesTable", 1, "Amount", 500.25)
+pkg.update_cell("Sheet1", "D10", formula="SUM(B1:B9)")
+pkg.merge_cells("Sheet1", "A1:C1")
+pkg.save("output.xlsm")
+```
