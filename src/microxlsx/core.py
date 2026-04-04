@@ -114,23 +114,27 @@ class XLSXPackage:
 
     def _set_cell_formula(self, cell, formula):
         """Helper to set cell formula."""
-        f_node = cell.find(f"{{{self.NS['main']}}}f") or \
-                 ET.SubElement(cell, f"{{{self.NS['main']}}}f")
+        f_node = cell.find(f"{{{self.NS['main']}}}f")
+        if f_node is None:
+            f_node = ET.SubElement(cell, f"{{{self.NS['main']}}}f")
         f_node.text = formula.lstrip('=')
 
     def _set_cell_value(self, cell, value):
         """Helper to set cell value."""
         if isinstance(value, (int, float)):
-            v_node = cell.find(f"{{{self.NS['main']}}}v") or \
-                     ET.SubElement(cell, f"{{{self.NS['main']}}}v")
+            v_node = cell.find(f"{{{self.NS['main']}}}v")
+            if v_node is None:
+                v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
             v_node.text = str(value)
             cell.attrib.pop('t', None)
         else:
             cell.set('t', 'inlineStr')
-            is_node = cell.find(f"{{{self.NS['main']}}}is") or \
-                      ET.SubElement(cell, f"{{{self.NS['main']}}}is")
-            t_node = is_node.find(f"{{{self.NS['main']}}}t") or \
-                     ET.SubElement(is_node, f"{{{self.NS['main']}}}t")
+            is_node = cell.find(f"{{{self.NS['main']}}}is")
+            if is_node is None:
+                is_node = ET.SubElement(cell, f"{{{self.NS['main']}}}is")
+            t_node = is_node.find(f"{{{self.NS['main']}}}t")
+            if t_node is None:
+                t_node = ET.SubElement(is_node, f"{{{self.NS['main']}}}t")
             t_node.text = str(value)
 
     # pylint: disable=too-many-arguments
