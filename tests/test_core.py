@@ -1,9 +1,8 @@
 """
 Unit tests for microxlsx.core
 """
+# pylint: disable=missing-class-docstring,missing-function-docstring
 import zipfile
-import xml.etree.ElementTree as ET
-import pytest
 
 from microxlsx.core import XLSXPackage
 
@@ -94,7 +93,7 @@ class TestInit:
 
     def test_table_map_empty_without_table(self, tmp_path):
         pkg = XLSXPackage(make_xlsx(tmp_path))
-        assert pkg.table_map == {}
+        assert not pkg.table_map
 
     def test_table_map_populated(self, tmp_path):
         pkg = XLSXPackage(make_xlsx(tmp_path, with_table=True))

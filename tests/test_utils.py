@@ -1,6 +1,7 @@
 """
 Unit tests for microxlsx.utils
 """
+# pylint: disable=missing-class-docstring,missing-function-docstring,too-few-public-methods
 import pytest
 from microxlsx.utils import cell_to_indices, indices_to_cell
 
