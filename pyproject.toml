@@ -18,5 +18,11 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Spreadsheet",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
 [project.urls]
 "Homepage" = "https://github.com/lucianpopovici/microxlsx"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
