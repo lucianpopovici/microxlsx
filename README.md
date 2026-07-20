@@ -46,9 +46,19 @@ pkg.update_cell("Sheet1", "F10", value=datetime.date(2026, 1, 31))  # auto date 
 money = pkg.add_number_format("$#,##0.00")
 pkg.update_cell("Sheet1", "G10", value=1999.9, style_id=money)
 
+# Inspect, append rows, clear cells, size columns/rows
+pkg.sheet_names(); pkg.table_names(); pkg.table_dimensions("SalesTable")
+pkg.append_table_row("SalesTable", {"Region": "West", "Amount": 320})
+pkg.clear_cell("Sheet1", "H10")
+pkg.set_column_width("Sheet1", "B", 18)
+pkg.set_row_height("Sheet1", 1, 24)
+
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
+
+`append_table_row` grows the table and shoves any table directly below it out
+of the way (minimal, cascading) — the same collision handling as `resize_table`.
 
 `get_cell` / `get_table_cell` return `str` / `int` / `float` / `bool` (or a
 formula cell's cached result), or `None` for an empty cell. Reading a sheet you

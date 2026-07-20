@@ -103,6 +103,93 @@ class XLSXPackage:
             'columns': col_map
         }
 
+    def sheet_names(self):
+        """Return the workbook's sheet names, in relationship order."""
+        return list(self.sheet_map)
+
+    def table_names(self):
+        """Return the names of all tables across the workbook."""
+        return list(self.table_map)
+
+    def table_dimensions(self, table_name):
+        """Return ``(rows, cols)`` of a table, counting its header row."""
+        top, left = self.table_map[table_name]['start_indices']
+        bottom, right = cell_to_indices(self.table_map[table_name]['range'][1])
+        return (bottom - top + 1, right - left + 1)
+
+    def _sheet_root(self, sheet_name):
+        """Return a worksheet's root element, loading it for editing if needed."""
+        path = self.sheet_map.get(sheet_name, sheet_name)
+        if path not in self.trees:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                self._get_tree(zin, path)
+        return self.trees[path].getroot()
+
+    def clear_cell(self, sheet_name, cell_ref):
+        """Remove a cell entirely (leaves the row); flags a recalc."""
+        ns = self.NS['main']
+        sheet_data = self._sheet_root(sheet_name).find(f".//{{{ns}}}sheetData")
+        row = sheet_data.find(f"{{{ns}}}row[@r='{cell_to_indices(cell_ref)[0] + 1}']")
+        if row is None:
+            return
+        cell = row.find(f"{{{ns}}}c[@r='{cell_ref}']")
+        if cell is not None:
+            row.remove(cell)
+            self._set_full_calc_on_load()
+
+    def append_table_row(self, table_name, values):
+        """Append a data row to a table, expanding its range.
+
+        ``values`` may be a ``{column_name: value}`` mapping or a positional
+        list/tuple in column order. Returns the new row's 0-based offset.
+        """
+        table = self.table_map[table_name]
+        start_row = table['start_indices'][0]
+        end_row = cell_to_indices(table['range'][1])[0]
+        offset = (end_row - start_row) + 1
+        # Grow via resize_table so any table directly below is shoved aside
+        # (minimally, cascading) instead of being overwritten.
+        self.resize_table(table_name, add_rows=1)
+        if isinstance(values, dict):
+            items = list(values.items())
+        else:
+            names = {idx: name for name, idx in table['columns'].items()}
+            items = [(names[i], val) for i, val in enumerate(values)]
+        for col_name, val in items:
+            self.update_table_cell(table_name, offset, col_name, val)
+        return offset
+
+    def set_column_width(self, sheet_name, column, width):
+        """Set a column's width. ``column`` is a letter (``"A"``) or 0-based int."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        idx = column if isinstance(column, int) else cell_to_indices(f"{column}1")[1]
+        num = str(idx + 1)  # <col> uses 1-based min/max
+        cols = root.find(f"{{{ns}}}cols")
+        if cols is None:
+            cols = ET.Element(f"{{{ns}}}cols")
+            sheet_data = root.find(f"{{{ns}}}sheetData")
+            root.insert(list(root).index(sheet_data), cols)  # cols precedes sheetData
+        col = next(
+            (c for c in cols.findall(f"{{{ns}}}col")
+             if c.get('min') == num and c.get('max') == num),
+            None,
+        )
+        if col is None:
+            col = ET.SubElement(cols, f"{{{ns}}}col")
+            col.set('min', num)
+            col.set('max', num)
+        col.set('width', str(width))
+        col.set('customWidth', '1')
+
+    def set_row_height(self, sheet_name, row, height):
+        """Set a row's height. ``row`` is the 1-based row number."""
+        ns = self.NS['main']
+        sheet_data = self._sheet_root(sheet_name).find(f"{{{ns}}}sheetData")
+        row_el = self._row_get_or_create(sheet_data, int(row))
+        row_el.set('ht', str(height))
+        row_el.set('customHeight', '1')
+
     def merge_cells(self, sheet_name, cell_range):
         """Adds a merge rule to the worksheet."""
         path = self.sheet_map.get(sheet_name, sheet_name)

@@ -1402,3 +1402,113 @@ class TestRecalcOnValueEdit:
         with zipfile.ZipFile(out, "r") as zf:
             assert "xl/calcChain.xml" in zf.namelist()
             assert zf.read("xl/workbook.xml").decode().count("fullCalcOnLoad") == 1
+
+
+class TestInspection:
+    def test_sheet_names(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        assert pkg.sheet_names() == ["Sheet1"]
+
+    def test_table_names(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        assert sorted(pkg.table_names()) == ["Bottom", "Far", "Side", "Top"]
+
+    def test_table_dimensions(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        assert pkg.table_dimensions("Top") == (3, 2)   # A1:B3 incl. header
+        assert pkg.table_dimensions("Side") == (7, 2)  # D1:E7
+
+
+class TestClearCell:
+    def _cell(self, pkg, ref):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f".//{{{NS}}}c[@r='{ref}']")
+
+    def test_clears_existing_cell(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))  # A1 = "Hello"
+        pkg.clear_cell("Sheet1", "A1")
+        assert self._cell(pkg, "A1") is None
+        assert pkg.get_cell("Sheet1", "A1") is None
+
+    def test_missing_cell_is_noop(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.clear_cell("Sheet1", "Z9")  # should not raise
+
+    def test_row_survives(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.clear_cell("Sheet1", "A1")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f".//{{{NS}}}row[@r='1']") is not None
+
+    def test_clear_flags_recalc(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.clear_cell("Sheet1", "A1")
+        assert pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}calcPr") is not None
+
+
+class TestAppendTableRow:
+    def test_dict_values(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        offset = pkg.append_table_row("Top", {"Top_c1": "x", "Top_c2": 5})
+        assert offset == 3
+        assert pkg.table_map["Top"]["range"] == ["A1", "B4"]
+        assert pkg.get_cell("Sheet1", "A4") == "x"
+        assert pkg.get_cell("Sheet1", "B4") == 5
+
+    def test_positional_values(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.append_table_row("Top", ["a", "b"])
+        assert pkg.get_cell("Sheet1", "A4") == "a"
+        assert pkg.get_cell("Sheet1", "B4") == "b"
+
+    def test_append_shoves_colliding_table(self, tmp_path):
+        # Top A1:B3, Bottom A5:B7 (gap at row 4). Two appends push into row 5.
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.append_table_row("Top", {"Top_c1": "1"})
+        pkg.append_table_row("Top", {"Top_c1": "2"})
+        assert pkg.table_map["Top"]["range"] == ["A1", "B5"]
+        assert pkg.table_map["Bottom"]["range"] == ["A6", "B8"]  # shoved down 1
+
+
+class TestColumnRowSizing:
+    def _root(self, pkg):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+
+    def test_set_column_width_by_letter(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", "C", 25)
+        col = self._root(pkg).find(f"{{{NS}}}cols/{{{NS}}}col")
+        assert col.get("min") == "3" and col.get("max") == "3"
+        assert col.get("width") == "25" and col.get("customWidth") == "1"
+
+    def test_set_column_width_by_index(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", 0, 12)  # 0-based -> column A
+        col = self._root(pkg).find(f"{{{NS}}}cols/{{{NS}}}col")
+        assert col.get("min") == "1"
+
+    def test_cols_precedes_sheetdata(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", "A", 10)
+        root = self._root(pkg)
+        children = list(root)
+        assert children.index(root.find(f"{{{NS}}}cols")) < \
+            children.index(root.find(f"{{{NS}}}sheetData"))
+
+    def test_column_width_updates_existing(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", "A", 10)
+        pkg.set_column_width("Sheet1", "A", 20)
+        cols = self._root(pkg).findall(f"{{{NS}}}cols/{{{NS}}}col")
+        assert len(cols) == 1 and cols[0].get("width") == "20"
+
+    def test_set_row_height(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_row_height("Sheet1", 2, 30)
+        row = self._root(pkg).find(f".//{{{NS}}}row[@r='2']")
+        assert row.get("ht") == "30" and row.get("customHeight") == "1"
+
+    def test_set_row_height_existing_row(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))  # row 1 already exists
+        pkg.set_row_height("Sheet1", 1, 42)
+        rows = self._root(pkg).findall(f".//{{{NS}}}row[@r='1']")
+        assert len(rows) == 1 and rows[0].get("ht") == "42"
