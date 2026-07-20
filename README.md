@@ -35,3 +35,25 @@ pkg.update_cell("Sheet1", "D10", formula="SUM(B1:B9)")
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
+
+** 📐 Resizing tables with minimal movement
+
+`resize_table` grows (or shrinks) a table by a number of rows and/or columns.
+When growing, any tables that would collide are shoved by the **minimal amount**
+needed to clear the target — **down** for row growth, **right** for column
+growth — cascading through further tables. Tables that don't overlap on the
+cross axis, or that have an existing gap, are left untouched.
+
+```python
+pkg = XLSXPackage("report.xlsx")
+pkg.resize_table("SalesTable", add_rows=5)            # grow rows, push down
+pkg.resize_table("SalesTable", add_cols=2)            # grow cols, push right
+pkg.resize_table("SalesTable", add_rows=3, add_cols=1)  # both at once
+pkg.resize_table("Notes", add_rows=-2)               # shrink (never moves others)
+pkg.save("output.xlsx")
+```
+
+Column growth also appends `tableColumn` metadata (with unique ids/names) and
+writes the new header cells. When a table is moved, its cell block (values,
+formulas, styles) is relocated, but formula *references* into the moved region,
+merged-cell ranges, and conditional-formatting ranges are not yet rewritten.

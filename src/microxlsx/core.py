@@ -158,6 +158,232 @@ class XLSXPackage:
             table['sheet'], indices_to_cell(abs_row, abs_col), value=value, style_id=style_id
         )
 
+    def resize_table(self, table_name, *, add_rows=0, add_cols=0):
+        """Grow or shrink a table along the row and/or column axis.
+
+        Growing shoves any tables that would collide below (row growth) or to
+        the right (column growth) of the target by the *minimal* amount needed
+        to clear it, cascading through further tables. Shrinking (negative
+        deltas) only narrows the range and never moves other tables. Column
+        growth also appends ``tableColumn`` metadata + header cells; formula
+        and merge-range rewriting remains out of scope.
+        """
+        if add_rows == 0 and add_cols == 0:
+            return
+        table = self.table_map[table_name]
+        with zipfile.ZipFile(self.filename, 'r') as zin:
+            self._get_tree(zin, self.sheet_map[table['sheet']])
+        if add_rows:
+            self._resize_rows(table_name, table, add_rows)
+        if add_cols:
+            self._resize_cols(table_name, table, add_cols)
+
+    def _resize_rows(self, target_name, table, add_rows):
+        """Apply a row-axis resize (axis 0), shoving colliding tables down."""
+        top, _ = table['start_indices']
+        end_r, end_c = cell_to_indices(table['range'][1])
+        new_end_r = end_r + add_rows
+        if new_end_r < top:
+            raise ValueError(
+                f"resize_table: add_rows={add_rows} would shrink "
+                f"'{target_name}' above its header row"
+            )
+        table['range'][1] = indices_to_cell(new_end_r, end_c)
+        self.trees[table['xml_path']].getroot().set(
+            'ref', f"{table['range'][0]}:{table['range'][1]}"
+        )
+        if add_rows > 0:
+            self._resolve_collisions(target_name, table, axis=0)
+
+    def _resize_cols(self, target_name, table, add_cols):
+        """Apply a column-axis resize (axis 1), shoving colliding tables right."""
+        top, left = table['start_indices']
+        end_r, end_c = cell_to_indices(table['range'][1])
+        new_end_c = end_c + add_cols
+        if new_end_c < left:
+            raise ValueError(
+                f"resize_table: add_cols={add_cols} would remove all "
+                f"columns of '{target_name}'"
+            )
+        table['range'][1] = indices_to_cell(end_r, new_end_c)
+        self.trees[table['xml_path']].getroot().set(
+            'ref', f"{table['range'][0]}:{table['range'][1]}"
+        )
+        added = self._adjust_table_columns(table, add_cols, end_c)
+        if add_cols > 0:
+            self._resolve_collisions(target_name, table, axis=1)
+            # Header cells go in last, after colliding tables have vacated.
+            for abs_col, name in added:
+                self.update_cell(
+                    table['sheet'], indices_to_cell(top, abs_col), value=name
+                )
+
+    def _adjust_table_columns(self, table, add_cols, old_end_c):
+        """Add/remove ``tableColumn`` entries; return new (abs_col, name) pairs."""
+        ns = self.NS['main']
+        cols_el = self.trees[table['xml_path']].getroot().find(
+            f"{{{ns}}}tableColumns"
+        )
+        columns = list(cols_el)
+        added = []
+        if add_cols > 0:
+            names = {c.get('name') for c in columns}
+            next_id = max((int(c.get('id')) for c in columns), default=0) + 1
+            for k in range(add_cols):
+                name = self._unique_col_name(names, len(columns) + k + 1)
+                names.add(name)
+                col_el = ET.SubElement(cols_el, f"{{{ns}}}tableColumn")
+                col_el.set('id', str(next_id))
+                col_el.set('name', name)
+                next_id += 1
+                table['columns'][name] = len(columns) + k
+                added.append((old_end_c + 1 + k, name))
+        else:
+            for col_el in columns[len(columns) + add_cols:]:
+                table['columns'].pop(col_el.get('name'), None)
+                cols_el.remove(col_el)
+        cols_el.set('count', str(len(list(cols_el))))
+        return added
+
+    @staticmethod
+    def _unique_col_name(existing, start):
+        """Return the first ``Column{n}`` name not already in ``existing``."""
+        i = start
+        while f"Column{i}" in existing:
+            i += 1
+        return f"Column{i}"
+
+    @staticmethod
+    def _table_box(table):
+        """Return (top, left, bottom, right) 0-based indices of a table."""
+        top, left = table['start_indices']
+        bottom, right = cell_to_indices(table['range'][1])
+        return top, left, bottom, right
+
+    # pylint: disable=too-many-locals
+    def _resolve_collisions(self, target_name, target, axis):
+        """Compute minimal shifts for tables the target now overlaps.
+
+        ``axis=0`` shoves colliding tables down, ``axis=1`` shoves them right.
+        Starting from a valid (non-overlapping) layout, only the target's new
+        trailing edge can trigger shifts, so movement stays minimal.
+        """
+        lead = 0 if axis == 0 else 1          # top / left
+        trail = 2 if axis == 0 else 3         # bottom / right
+        cross_lo, cross_hi = (1, 3) if axis == 0 else (0, 2)
+        tables = {
+            name: t for name, t in self.table_map.items()
+            if t['sheet'] == target['sheet']
+        }
+        orig_lead = {name: self._table_box(t)[lead] for name, t in tables.items()}
+        shift = {name: 0 for name in tables}
+
+        changed = True
+        while changed:
+            changed = False
+            for a_name, a_tbl in tables.items():
+                a_box = self._table_box(a_tbl)
+                a_trail = a_box[trail] + shift[a_name]
+                for b_name, b_tbl in tables.items():
+                    if b_name in (a_name, target_name):
+                        continue  # never move the target itself
+                    if orig_lead[a_name] >= orig_lead[b_name]:
+                        continue  # only push tables that started after A
+                    b_box = self._table_box(b_tbl)
+                    if a_box[cross_hi] < b_box[cross_lo] or \
+                            b_box[cross_hi] < a_box[cross_lo]:
+                        continue  # no overlap on the cross axis
+                    needed = (a_trail + 1) - (b_box[lead] + shift[b_name])
+                    if needed > 0:
+                        shift[b_name] += needed
+                        changed = True
+
+        # Apply moves furthest-first so each destination band is already clear.
+        movers = [n for n in tables if n != target_name and shift[n] > 0]
+        movers.sort(key=lambda n: orig_lead[n], reverse=True)
+        for name in movers:
+            self._move_table(tables[name], shift[name], axis)
+
+    def _move_table(self, table, delta, axis):
+        """Relocate a table's cell block by ``delta`` along ``axis`` and update refs."""
+        if delta <= 0:
+            return
+        ns = self.NS['main']
+        sheet_data = self.trees[self.sheet_map[table['sheet']]].getroot().find(
+            f".//{{{ns}}}sheetData"
+        )
+        top, left, bottom, right = self._table_box(table)
+        # Iterate away from the move direction so a cell is never overwritten
+        # before it is relocated.
+        rows = range(bottom, top - 1, -1) if axis == 0 else range(top, bottom + 1)
+        cols = range(left, right + 1) if axis == 0 else range(right, left - 1, -1)
+        for row_idx in rows:
+            row = sheet_data.find(f"{{{ns}}}row[@r='{row_idx + 1}']")
+            if row is None:
+                continue
+            for col in cols:
+                new_row_idx = row_idx + delta if axis == 0 else row_idx
+                new_col = col if axis == 0 else col + delta
+                self._relocate_cell(
+                    sheet_data, row, indices_to_cell(row_idx, col),
+                    new_row_idx=new_row_idx, new_col=new_col
+                )
+
+        new_top = top + (delta if axis == 0 else 0)
+        new_left = left + (delta if axis == 1 else 0)
+        new_bottom = bottom + (delta if axis == 0 else 0)
+        new_right = right + (delta if axis == 1 else 0)
+        table['start_indices'] = (new_top, new_left)
+        table['range'] = [
+            indices_to_cell(new_top, new_left),
+            indices_to_cell(new_bottom, new_right),
+        ]
+        self.trees[table['xml_path']].getroot().set(
+            'ref', f"{table['range'][0]}:{table['range'][1]}"
+        )
+
+    def _relocate_cell(self, sheet_data, src_row, old_ref, *, new_row_idx, new_col):
+        """Move a single cell from ``old_ref`` to (new_row_idx, new_col)."""
+        ns = self.NS['main']
+        cell = src_row.find(f"{{{ns}}}c[@r='{old_ref}']")
+        if cell is None:
+            return
+        src_row.remove(cell)
+        new_ref = indices_to_cell(new_row_idx, new_col)
+        cell.set('r', new_ref)
+        dest_row = self._row_get_or_create(sheet_data, new_row_idx + 1)
+        existing = dest_row.find(f"{{{ns}}}c[@r='{new_ref}']")
+        if existing is not None:
+            dest_row.remove(existing)
+        self._cell_insert_sorted(dest_row, cell)
+
+    def _row_get_or_create(self, sheet_data, row_num):
+        """Return the row element for ``row_num``, inserting it in sorted order."""
+        ns = self.NS['main']
+        existing = sheet_data.find(f"{{{ns}}}row[@r='{row_num}']")
+        if existing is not None:
+            return existing
+        new_row = ET.Element(f"{{{ns}}}row")
+        new_row.set('r', str(row_num))
+        idx = len(sheet_data)
+        for i, row in enumerate(sheet_data):
+            if int(row.get('r')) > row_num:
+                idx = i
+                break
+        sheet_data.insert(idx, new_row)
+        return new_row
+
+    @staticmethod
+    def _cell_insert_sorted(row, cell):
+        """Insert ``cell`` into ``row`` keeping cells ordered by column index."""
+        col = cell_to_indices(cell.get('r'))[1]
+        idx = len(row)
+        for i, existing in enumerate(row):
+            if cell_to_indices(existing.get('r'))[1] > col:
+                idx = i
+                break
+        row.insert(idx, cell)
+
     def save(self, output_path):
         """Preservation Loop."""
         with zipfile.ZipFile(self.filename, 'r') as zin:
