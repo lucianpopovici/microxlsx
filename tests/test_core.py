@@ -360,6 +360,97 @@ def make_calcpr_xlsx(tmp_path):
     return path
 
 
+def make_read_xlsx(tmp_path):
+    """XLSX exercising every readable cell type + a shared-strings table."""
+    path = str(tmp_path / "read.xlsx")
+    shared = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        b' count="2" uniqueCount="2">'
+        b"<si><t>Plain</t></si>"
+        b"<si><r><t>Rich</t></r><r><t>Text</t></r></si>"
+        b"</sst>"
+    )
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"><sheetData><row r="1">'
+        b'<c r="A1" t="s"><v>0</v></c>'          # shared string "Plain"
+        b'<c r="B1" t="s"><v>1</v></c>'          # shared string (rich) "RichText"
+        b'<c r="C1" t="inlineStr"><is><t>Inline</t></is></c>'
+        b'<c r="D1"><v>42</v></c>'               # int
+        b'<c r="E1"><v>3.5</v></c>'              # float
+        b'<c r="F1" t="b"><v>1</v></c>'          # bool
+        b'<c r="G1"><f>A1</f><v>7</v></c>'       # formula -> cached 7
+        b'<c r="H1" t="e"><v>#DIV/0!</v></c>'    # error
+        b"</row></sheetData></worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", WORKBOOK_XML)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/sharedStrings.xml", shared)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1"))
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"SalesTable", b"A1:B3"))
+    return path
+
+
+def make_calcchain_xlsx(tmp_path):
+    """XLSX with a calcChain part registered in content-types + workbook rels."""
+    path = str(tmp_path / "calc.xlsx")
+    workbook_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<workbook xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships">'
+        b'<sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>'
+    )
+    wb_rels = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/'
+        b'package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/worksheet"'
+        b' Target="worksheets/sheet1.xml"/>'
+        b'<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/calcChain" Target="calcChain.xml"/>'
+        b"</Relationships>"
+    )
+    content_types = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        b'<Default Extension="xml" ContentType="application/xml"/>'
+        b'<Override PartName="/xl/workbook.xml" ContentType="wb"/>'
+        b'<Override PartName="/xl/calcChain.xml"'
+        b' ContentType="application/vnd.openxmlformats-officedocument.'
+        b'spreadsheetml.calcChain+xml"/>'
+        b"</Types>"
+    )
+    calc_chain = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<calcChain xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"><c r="B5" i="1"/></calcChain>'
+    )
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"><sheetData>'
+        b'<row r="5"><c r="B5"><f>A5*2</f><v>0</v></c></row>'
+        b"</sheetData></worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        zf.writestr("xl/calcChain.xml", calc_chain)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2"))
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
 def make_xlsx(tmp_path, *, with_table=False):
     """Create a minimal in-memory XLSX (ZIP) file for testing."""
     path = str(tmp_path / "test.xlsx")
@@ -1041,3 +1132,125 @@ class TestFullCalcOnLoad:
         with zipfile.ZipFile(out, "r") as zf:
             wb = zf.read("xl/workbook.xml").decode("utf-8")
         assert 'fullCalcOnLoad="1"' in wb
+
+
+class TestGetCell:
+    def test_shared_string(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "A1") == "Plain"
+
+    def test_shared_string_rich_text_concatenated(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "B1") == "RichText"
+
+    def test_inline_string(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "C1") == "Inline"
+
+    def test_int(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        val = pkg.get_cell("Sheet1", "D1")
+        assert val == 42 and isinstance(val, int)
+
+    def test_float(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "E1") == 3.5
+
+    def test_bool(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "F1") is True
+
+    def test_formula_returns_cached_value(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "G1") == 7
+
+    def test_error_value(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "H1") == "#DIV/0!"
+
+    def test_missing_cell_is_none(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        assert pkg.get_cell("Sheet1", "Z9") is None
+
+    def test_reflects_pending_write(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "D1", value=99)
+        assert pkg.get_cell("Sheet1", "D1") == 99
+
+    def test_read_only_does_not_pollute_trees(self, tmp_path):
+        # Reading an untouched sheet must not pull it into the re-serialized set.
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.get_cell("Sheet1", "A1")
+        assert pkg.sheet_map["Sheet1"] not in pkg.trees
+
+    def test_get_table_cell(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        # SalesTable at A1:B3; row_offset 0, col "SalesTable_c1" -> A1 -> "Plain"
+        assert pkg.get_table_cell("SalesTable", 0, "SalesTable_c1") == "Plain"
+
+
+class TestBooleanWrite:
+    def _cell(self, pkg, ref):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        return root.find(f".//{{{NS}}}c[@r='{ref}']")
+
+    def test_true_writes_boolean_type(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B2", value=True)
+        cell = self._cell(pkg, "B2")
+        assert cell.get("t") == "b"
+        assert cell.find(f"{{{NS}}}v").text == "1"
+
+    def test_false_writes_zero(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B2", value=False)
+        assert self._cell(pkg, "B2").find(f"{{{NS}}}v").text == "0"
+
+    def test_bool_overwrites_inline_string(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))  # A1 starts as inlineStr "Hello"
+        pkg.update_cell("Sheet1", "A1", value=True)
+        cell = self._cell(pkg, "A1")
+        assert cell.get("t") == "b"
+        assert cell.find(f"{{{NS}}}is") is None
+
+    def test_bool_round_trips_through_read(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "C3", value=False)
+        assert pkg.get_cell("Sheet1", "C3") is False
+
+
+class TestCalcChainInvalidation:
+    def _saved(self, pkg, tmp_path):
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        return zipfile.ZipFile(out, "r")
+
+    def test_formula_edit_drops_calc_chain(self, tmp_path):
+        pkg = XLSXPackage(make_calcchain_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B5", formula="=A5*3")
+        with self._saved(pkg, tmp_path) as zf:
+            assert "xl/calcChain.xml" not in zf.namelist()
+            assert b"calcChain" not in zf.read("[Content_Types].xml")
+            assert b"calcChain" not in zf.read("xl/_rels/workbook.xml.rels")
+
+    def test_other_parts_preserved(self, tmp_path):
+        pkg = XLSXPackage(make_calcchain_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B5", formula="=A5*3")
+        with self._saved(pkg, tmp_path) as zf:
+            ct = zf.read("[Content_Types].xml")
+            rels = zf.read("xl/_rels/workbook.xml.rels")
+        assert b"/xl/workbook.xml" in ct            # unrelated override kept
+        assert b"worksheets/sheet1.xml" in rels     # worksheet rel kept
+
+    def test_move_drops_calc_chain(self, tmp_path):
+        pkg = XLSXPackage(make_calcchain_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)  # moves Bottom (has a formula)
+        with self._saved(pkg, tmp_path) as zf:
+            assert "xl/calcChain.xml" not in zf.namelist()
+
+    def test_value_only_edit_keeps_calc_chain(self, tmp_path):
+        pkg = XLSXPackage(make_calcchain_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B5", value=10)
+        with self._saved(pkg, tmp_path) as zf:
+            assert "xl/calcChain.xml" in zf.namelist()
+            assert b"calcChain" in zf.read("[Content_Types].xml")

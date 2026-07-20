@@ -37,6 +37,8 @@ class XLSXPackage:
         self.trees = {}
         self.sheet_map = {}
         self.table_map = {}
+        self._shared_strings = None
+        self._drop_calc_chain = False
         for prefix, uri in self.NS.items():
             ET.register_namespace(prefix if prefix != 'main' else '', uri)
         self._build_maps()
@@ -133,10 +135,20 @@ class XLSXPackage:
         if f_node is None:
             f_node = ET.SubElement(cell, f"{{{self.NS['main']}}}f")
         f_node.text = formula.lstrip('=')
+        self._invalidate_calc_cache()
 
     def _set_cell_value(self, cell, value):
         """Helper to set cell value."""
-        if isinstance(value, (int, float)):
+        if isinstance(value, bool):
+            cell.set('t', 'b')
+            is_node = cell.find(f"{{{self.NS['main']}}}is")
+            if is_node is not None:
+                cell.remove(is_node)
+            v_node = cell.find(f"{{{self.NS['main']}}}v")
+            if v_node is None:
+                v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
+            v_node.text = '1' if value else '0'
+        elif isinstance(value, (int, float)):
             v_node = cell.find(f"{{{self.NS['main']}}}v")
             if v_node is None:
                 v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
@@ -172,6 +184,79 @@ class XLSXPackage:
         self.update_cell(
             table['sheet'], indices_to_cell(abs_row, abs_col), value=value, style_id=style_id
         )
+
+    def get_cell(self, sheet_name, cell_ref):
+        """Read a cell's value, resolving shared strings and typed cells.
+
+        Returns ``str``/``int``/``float``/``bool`` (or the cached result of a
+        formula cell), or ``None`` for a missing or empty cell.
+        """
+        ns = self.NS['main']
+        path = self.sheet_map.get(sheet_name, sheet_name)
+        if path in self.trees:
+            root = self.trees[path].getroot()
+        else:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                with zin.open(path) as handle:
+                    root = ET.parse(handle).getroot()
+        cell = root.find(f".//{{{ns}}}c[@r='{cell_ref}']")
+        return None if cell is None else self._cell_value(cell)
+
+    def get_table_cell(self, table_name, row_offset, col_name):
+        """Read a table cell by column name (mirrors ``update_table_cell``)."""
+        table = self.table_map[table_name]
+        abs_row = table['start_indices'][0] + row_offset
+        abs_col = table['start_indices'][1] + table['columns'][col_name]
+        return self.get_cell(table['sheet'], indices_to_cell(abs_row, abs_col))
+
+    # pylint: disable=too-many-return-statements
+    def _cell_value(self, cell):
+        """Convert a ``<c>`` element into a Python value."""
+        ns = self.NS['main']
+        cell_type = cell.get('t')
+        if cell_type == 'inlineStr':
+            node = cell.find(f".//{{{ns}}}t")
+            return node.text if node is not None else None
+        value = cell.find(f"{{{ns}}}v")
+        if cell_type == 's':
+            if value is None or value.text is None:
+                return None
+            strings = self._shared_strings_list()
+            index = int(value.text)
+            return strings[index] if 0 <= index < len(strings) else None
+        if value is None or value.text is None:
+            return None
+        if cell_type == 'b':
+            return value.text == '1'
+        if cell_type in ('str', 'e'):
+            return value.text
+        return self._parse_number(value.text)
+
+    @staticmethod
+    def _parse_number(text):
+        """Parse a numeric cell payload, preserving int where exact."""
+        try:
+            return int(text)
+        except ValueError:
+            return float(text)
+
+    def _shared_strings_list(self):
+        """Lazily load ``xl/sharedStrings.xml`` as a list of plain strings."""
+        if self._shared_strings is None:
+            ns = self.NS['main']
+            self._shared_strings = []
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                try:
+                    handle = zin.open('xl/sharedStrings.xml')
+                except KeyError:
+                    return self._shared_strings
+                with handle:
+                    root = ET.parse(handle).getroot()
+            for si_node in root.findall(f"{{{ns}}}si"):
+                self._shared_strings.append(
+                    ''.join(t.text or '' for t in si_node.iter(f"{{{ns}}}t"))
+                )
+        return self._shared_strings
 
     def resize_table(self, table_name, *, add_rows=0, add_cols=0):
         """Grow or shrink a table along the row and/or column axis.
@@ -351,7 +436,7 @@ class XLSXPackage:
         self._rewrite_range_features(root, table['sheet'], box, delta=delta, axis=axis)
         self._rewrite_defined_names(table['sheet'], box, delta=delta, axis=axis)
         # Rewritten formulas leave cached <v> results stale; force a recalc.
-        self._set_full_calc_on_load()
+        self._invalidate_calc_cache()
 
         new_top = top + (delta if axis == 0 else 0)
         new_left = left + (delta if axis == 1 else 0)
@@ -503,6 +588,11 @@ class XLSXPackage:
             col += delta
         return f"{c_abs}{indices_to_cell(0, col)[:-1]}{r_abs}{row + 1}"
 
+    def _invalidate_calc_cache(self):
+        """Mark cached results stale: recalc on load + drop the calc chain."""
+        self._drop_calc_chain = True
+        self._set_full_calc_on_load()
+
     def _set_full_calc_on_load(self):
         """Flag the workbook so Excel recalculates on open (clears stale caches)."""
         ns = self.NS['main']
@@ -582,15 +672,39 @@ class XLSXPackage:
 
     def save(self, output_path):
         """Preservation Loop."""
+        drop = self._drop_calc_chain
+        if drop:
+            # workbook rels live in self.trees (loaded for sheet mapping), so
+            # drop the calcChain relationship there; [Content_Types].xml is
+            # streamed, so it is patched on the raw bytes below.
+            self._strip_calc_chain_relationship()
         with zipfile.ZipFile(self.filename, 'r') as zin:
             with zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
-                    if item.filename in self.trees:
+                    name = item.filename
+                    if drop and name == 'xl/calcChain.xml':
+                        continue  # stale after formula edits; Excel rebuilds it
+                    if name in self.trees:
                         buf = io.BytesIO()
                         buf.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n')
-                        self.trees[item.filename].write(
-                            buf, encoding='utf-8', xml_declaration=False
+                        self.trees[name].write(buf, encoding='utf-8', xml_declaration=False)
+                        zout.writestr(name, buf.getvalue())
+                    elif drop and name == '[Content_Types].xml':
+                        data = re.sub(
+                            rb'<Override\b[^>]*?PartName="/xl/calcChain\.xml"[^>]*?/>',
+                            b'', zin.read(name)
                         )
-                        zout.writestr(item.filename, buf.getvalue())
+                        zout.writestr(item, data)
                     else:
-                        zout.writestr(item, zin.read(item.filename))
+                        zout.writestr(item, zin.read(name))
+
+    def _strip_calc_chain_relationship(self):
+        """Remove the calcChain relationship from the workbook rels tree."""
+        rels = self.trees.get('xl/_rels/workbook.xml.rels')
+        if rels is None:
+            return
+        rel_ns = 'http://schemas.openxmlformats.org/package/2006/relationships'
+        root = rels.getroot()
+        for rel in root.findall(f"{{{rel_ns}}}Relationship"):
+            if (rel.get('Target') or '').endswith('calcChain.xml'):
+                root.remove(rel)
