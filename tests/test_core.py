@@ -168,6 +168,80 @@ def make_hcollision_xlsx(tmp_path):
     return path
 
 
+def make_formula_xlsx(tmp_path):
+    """XLSX with formulas + merged cells for row-move rewrite testing.
+
+    Tables Top (A1:B3) and Bottom (A5:B7) stacked in cols A-B. Formulas live
+    both inside Bottom (B5) and loose in col D/E; merges cover Top and Bottom.
+    """
+    path = str(tmp_path / "formula.xlsx")
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b"<sheetData>"
+        b'<row r="1">'
+        b'<c r="A1" t="inlineStr"><is><t>Top</t></is></c>'
+        b'<c r="D1"><f>SUM(A5:A7)</f></c>'
+        b'<c r="E1"><f>A1+1</f></c>'
+        b"</row>"
+        b'<row r="3">'
+        b'<c r="D3"><f>SUM(A5:A7)+LOG10(A5)</f></c>'
+        b'<c r="D4"><f>$A$5</f></c>'
+        b'<c r="D5"><f>Sheet2!A5</f></c>'
+        b"</row>"
+        b'<row r="5">'
+        b'<c r="A5" t="inlineStr"><is><t>x</t></is></c>'
+        b'<c r="B5"><f>A5*2</f></c>'
+        b"</row>"
+        b"</sheetData>"
+        b'<mergeCells count="2">'
+        b'<mergeCell ref="A1:B1"/>'
+        b'<mergeCell ref="A5:B5"/>'
+        b"</mergeCells>"
+        b"</worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", WORKBOOK_XML)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2")
+        )
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
+def make_hformula_xlsx(tmp_path):
+    """XLSX with formulas referencing a table that gets shoved right."""
+    path = str(tmp_path / "hformula.xlsx")
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b"<sheetData>"
+        b'<row r="1">'
+        b'<c r="A1" t="inlineStr"><is><t>Left</t></is></c>'
+        b'<c r="D1" t="inlineStr"><is><t>R</t></is></c>'
+        b'<c r="E1"><f>D1</f></c>'
+        b"</row>"
+        b'<row r="10"><c r="A10"><f>D1*2</f></c></row>'
+        b"</sheetData>"
+        b"</worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", WORKBOOK_XML)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2")
+        )
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Left", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Right", b"D1:E3"))
+    return path
+
+
 def make_xlsx(tmp_path, *, with_table=False):
     """Create a minimal in-memory XLSX (ZIP) file for testing."""
     path = str(tmp_path / "test.xlsx")
@@ -637,3 +711,69 @@ class TestResizeTableColumns:
         assert 'count="5"' in table1
         assert 'ref="F1:G3"' in table2
         assert 'r="F1"' in sheet
+
+
+class TestFormulaMergeRewrite:
+    def _f(self, pkg, cell_ref):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        cell = root.find(f".//{{{NS}}}c[@r='{cell_ref}']")
+        return None if cell is None else cell.find(f"{{{NS}}}f").text
+
+    def _merges(self, pkg):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        mc = root.find(f"{{{NS}}}mergeCells")
+        return {m.get("ref") for m in mc.findall(f"{{{NS}}}mergeCell")}
+
+    def test_range_ref_to_moved_cells_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)  # Bottom shifts down 2
+        assert self._f(pkg, "D1") == "SUM(A7:A9)"
+
+    def test_ref_to_unmoved_cell_unchanged(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._f(pkg, "E1") == "A1+1"
+
+    def test_function_name_not_mangled(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._f(pkg, "D3") == "SUM(A7:A9)+LOG10(A7)"
+
+    def test_absolute_ref_shifts_and_keeps_markers(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._f(pkg, "D4") == "$A$7"
+
+    def test_cross_sheet_ref_untouched(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._f(pkg, "D5") == "Sheet2!A5"
+
+    def test_formula_inside_moved_table_follows(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._f(pkg, "B7") == "A7*2"  # B5 -> B7, A5 -> A7
+
+    def test_merged_cell_in_moved_block_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        merges = self._merges(pkg)
+        assert "A7:B7" in merges  # A5:B5 followed Bottom down
+        assert "A1:B1" in merges  # Top's merge stayed put
+
+    def test_column_move_shifts_refs(self, tmp_path):
+        pkg = XLSXPackage(make_hformula_xlsx(tmp_path))
+        pkg.resize_table("Left", add_cols=3)  # Right shifts right 2
+        assert pkg.table_map["Right"]["range"] == ["F1", "G3"]
+        assert self._f(pkg, "A10") == "F1*2"  # loose ref D1 -> F1
+        assert self._f(pkg, "G1") == "F1"     # E1 formula -> G1, D1 -> F1
+
+    def test_save_roundtrip_persists_rewrites(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert "SUM(A7:A9)" in sheet
+        assert "A7:B7" in sheet

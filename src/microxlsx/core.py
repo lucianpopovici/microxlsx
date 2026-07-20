@@ -1,10 +1,17 @@
 """
 Core functionality for MicroXLSX.
 """
+import re
 import zipfile
 import io
 import xml.etree.ElementTree as ET
 from .utils import cell_to_indices, indices_to_cell
+
+# A1-style reference: optional 'Sheet'! qualifier, optional $ absolute markers.
+_CELL_REF_RE = re.compile(
+    r"(?P<sheet>(?:'[^']+'|[A-Za-z0-9_.]+)!)?"
+    r"(?P<c_abs>\$?)(?P<col>[A-Za-z]{1,3})(?P<r_abs>\$?)(?P<row>[0-9]+)"
+)
 
 class XLSXPackage:
     """
@@ -165,8 +172,9 @@ class XLSXPackage:
         the right (column growth) of the target by the *minimal* amount needed
         to clear it, cascading through further tables. Shrinking (negative
         deltas) only narrows the range and never moves other tables. Column
-        growth also appends ``tableColumn`` metadata + header cells; formula
-        and merge-range rewriting remains out of scope.
+        growth also appends ``tableColumn`` metadata + header cells. When a
+        table is moved, formulas referencing its cells and merged ranges inside
+        it are rewritten to follow the move.
         """
         if add_rows == 0 and add_cols == 0:
             return
@@ -309,10 +317,10 @@ class XLSXPackage:
         if delta <= 0:
             return
         ns = self.NS['main']
-        sheet_data = self.trees[self.sheet_map[table['sheet']]].getroot().find(
-            f".//{{{ns}}}sheetData"
-        )
-        top, left, bottom, right = self._table_box(table)
+        root = self.trees[self.sheet_map[table['sheet']]].getroot()
+        sheet_data = root.find(f".//{{{ns}}}sheetData")
+        box = self._table_box(table)
+        top, left, bottom, right = box
         # Iterate away from the move direction so a cell is never overwritten
         # before it is relocated.
         rows = range(bottom, top - 1, -1) if axis == 0 else range(top, bottom + 1)
@@ -329,6 +337,10 @@ class XLSXPackage:
                     new_row_idx=new_row_idx, new_col=new_col
                 )
 
+        # References that pointed into the moved block follow it to its new home.
+        self._rewrite_formulas(sheet_data, table['sheet'], box, delta=delta, axis=axis)
+        self._shift_merged_cells(root, box, delta, axis)
+
         new_top = top + (delta if axis == 0 else 0)
         new_left = left + (delta if axis == 1 else 0)
         new_bottom = bottom + (delta if axis == 0 else 0)
@@ -341,6 +353,73 @@ class XLSXPackage:
         self.trees[table['xml_path']].getroot().set(
             'ref', f"{table['range'][0]}:{table['range'][1]}"
         )
+
+    def _rewrite_formulas(self, sheet_data, sheet_name, box, *, delta, axis):
+        """Shift every reference into ``box`` by ``delta`` across all formulas."""
+        ns = self.NS['main']
+        for f_node in sheet_data.iter(f"{{{ns}}}f"):
+            if f_node.text:
+                f_node.text = self._shift_formula_refs(
+                    f_node.text, sheet_name, box, delta=delta, axis=axis
+                )
+            shared_ref = f_node.get('ref')
+            if shared_ref:
+                moved = self._shift_range_ref(shared_ref, box, delta, axis)
+                if moved is not None:
+                    f_node.set('ref', moved)
+
+    def _shift_formula_refs(self, text, sheet_name, box, *, delta, axis):
+        """Return ``text`` with each A1 reference inside ``box`` shifted."""
+        top, left, bottom, right = box
+
+        def repl(match):
+            sheet = match.group('sheet')
+            if sheet and sheet[:-1].strip("'") != sheet_name:
+                return match.group(0)  # a different sheet
+            start = match.start()
+            if start > 0 and (text[start - 1].isalnum() or text[start - 1] == '_'):
+                return match.group(0)  # part of a longer name
+            if match.end() < len(text) and text[match.end()] == '(':
+                return match.group(0)  # a function call, not a reference
+            row, col = cell_to_indices(match.group('col') + match.group('row'))
+            if not (top <= row <= bottom and left <= col <= right):
+                return match.group(0)
+            if axis == 0:
+                row += delta
+            else:
+                col += delta
+            letters = indices_to_cell(0, col)[:-1]
+            return (f"{sheet or ''}{match.group('c_abs')}{letters}"
+                    f"{match.group('r_abs')}{row + 1}")
+
+        return _CELL_REF_RE.sub(repl, text)
+
+    def _shift_merged_cells(self, root, box, delta, axis):
+        """Shift ``mergeCell`` ranges fully contained in ``box`` by ``delta``."""
+        ns = self.NS['main']
+        merge_cells = root.find(f"{{{ns}}}mergeCells")
+        if merge_cells is None:
+            return
+        for merge in merge_cells.findall(f"{{{ns}}}mergeCell"):
+            moved = self._shift_range_ref(merge.get('ref'), box, delta, axis)
+            if moved is not None:
+                merge.set('ref', moved)
+
+    @staticmethod
+    def _shift_range_ref(ref, box, delta, axis):
+        """Shift a cell/range ref by ``delta`` if fully inside ``box``, else None."""
+        top, left, bottom, right = box
+        coords = [cell_to_indices(part) for part in ref.split(':')]
+        if any(not (top <= r <= bottom and left <= c <= right) for r, c in coords):
+            return None
+        shifted = []
+        for row, col in coords:
+            if axis == 0:
+                row += delta
+            else:
+                col += delta
+            shifted.append(indices_to_cell(row, col))
+        return ':'.join(shifted)
 
     def _relocate_cell(self, sheet_data, src_row, old_ref, *, new_row_idx, new_col):
         """Move a single cell from ``old_ref`` to (new_row_idx, new_col)."""
