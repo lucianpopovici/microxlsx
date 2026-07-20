@@ -284,6 +284,50 @@ def make_cfdv_xlsx(tmp_path):
     return path
 
 
+def make_named_range_xlsx(tmp_path):
+    """XLSX whose workbook.xml carries defined names for move testing.
+
+    Tables Top (A1:B3) and Bottom (A5:B7) in cols A-B. Named ranges cover
+    Bottom, Top, another sheet, and a single cell.
+    """
+    path = str(tmp_path / "named.xlsx")
+    workbook_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<workbook xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships">'
+        b'<sheets><sheet name="Sheet1" r:id="rId1"/></sheets>'
+        b"<definedNames>"
+        b'<definedName name="BottomData">Sheet1!$A$5:$A$7</definedName>'
+        b'<definedName name="TopData">Sheet1!$A$1:$A$3</definedName>'
+        b'<definedName name="OtherSheet">Sheet2!$A$5:$A$7</definedName>'
+        b'<definedName name="SingleCell">Sheet1!$A$5</definedName>'
+        b'<definedName name="Summed">SUM(Sheet1!$A$5:$A$7)</definedName>'
+        b"</definedNames>"
+        b"</workbook>"
+    )
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b'<sheetData><row r="5">'
+        b'<c r="A5" t="inlineStr"><is><t>x</t></is></c>'
+        b"</row></sheetData>"
+        b"</worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2")
+        )
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
 def make_xlsx(tmp_path, *, with_table=False):
     """Create a minimal in-memory XLSX (ZIP) file for testing."""
     path = str(tmp_path / "test.xlsx")
@@ -876,3 +920,51 @@ class TestConditionalFormattingDataValidation:
             sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
         assert 'sqref="A7:B9"' in sheet
         assert 'sqref="A7:A9"' in sheet
+
+
+class TestDefinedNames:
+    def _names(self, pkg):
+        root = pkg.trees["xl/workbook.xml"].getroot()
+        dn = root.find(f"{{{NS}}}definedNames")
+        return {n.get("name"): n.text for n in dn.findall(f"{{{NS}}}definedName")}
+
+    def test_named_range_over_moved_table_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)  # Bottom shifts down 2
+        assert self._names(pkg)["BottomData"] == "Sheet1!$A$7:$A$9"
+
+    def test_named_range_over_static_table_untouched(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._names(pkg)["TopData"] == "Sheet1!$A$1:$A$3"
+
+    def test_named_range_other_sheet_untouched(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._names(pkg)["OtherSheet"] == "Sheet2!$A$5:$A$7"
+
+    def test_single_cell_named_range_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._names(pkg)["SingleCell"] == "Sheet1!$A$7"
+
+    def test_formula_valued_name_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert self._names(pkg)["Summed"] == "SUM(Sheet1!$A$7:$A$9)"
+
+    def test_column_move_shifts_named_range(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_cols=3)  # no vertical collision; Bottom stays
+        # Bottom didn't move (different rows), so BottomData is unchanged.
+        assert self._names(pkg)["BottomData"] == "Sheet1!$A$5:$A$7"
+
+    def test_save_roundtrip_persists(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            wb = zf.read("xl/workbook.xml").decode("utf-8")
+        assert "Sheet1!$A$7:$A$9" in wb
+        assert "Sheet2!$A$5:$A$7" in wb

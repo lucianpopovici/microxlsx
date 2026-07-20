@@ -64,5 +64,9 @@ formulas, styles) is relocated, and references follow the data:
   * **Merged-cell ranges** contained in the moved block shift with it.
   * **Conditional-formatting** and **data-validation** regions (their `sqref`)
     and the formulas inside their rules shift with the moved block.
+  * **Named ranges** (workbook `definedName` entries) whose range points into
+    the moved block are shifted, matched to the moving table's sheet.
 
-Not yet rewritten: structured table references (`Table[Col]`) and named ranges.
+**Structured table references** (`Table[Col]`) resolve by name through the
+table definition, so they follow moves and resizes automatically — no rewriting
+needed. Ranges that only *partially* overlap the moved block are left unchanged.
