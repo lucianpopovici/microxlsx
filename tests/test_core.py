@@ -1914,3 +1914,244 @@ class TestDateRoundTrip:
         pkg = XLSXPackage(make_date1904_xlsx(tmp_path))
         pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
         assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
+
+
+class TestStyleGetters:
+    def test_get_cell_style_returns_id(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(bold=True)
+        pkg.update_cell("Sheet1", "A1", value=1, style_id=sid)
+        assert pkg.get_cell_style("Sheet1", "A1") == sid
+
+    def test_get_cell_style_unstyled_and_missing(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=1)
+        assert pkg.get_cell_style("Sheet1", "A1") is None
+        assert pkg.get_cell_style("Sheet1", "Z9") is None
+
+    def test_get_cell_style_read_only_does_not_pollute(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.get_cell_style("Sheet1", "A1")
+        assert pkg.sheet_map["Sheet1"] not in pkg.trees
+
+    def test_get_style_decodes_composed_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(bold=True, font_size=12, font_name="Arial",
+                            font_color="#FF0000", fill_color="DDEBF7",
+                            border="thin", align="center", valign="top",
+                            wrap=True, number_format="$#,##0.00")
+        decoded = pkg.get_style(sid)
+        assert decoded == {
+            "number_format": "$#,##0.00", "bold": True, "italic": False,
+            "font_size": 12.0, "font_name": "Arial", "font_color": "FF0000",
+            "fill_color": "DDEBF7", "border": "thin", "align": "center",
+            "valign": "top", "wrap": True,
+        }
+
+    def test_get_style_round_trips_through_add_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(italic=True, fill_color="EEEEEE", align="right")
+        clone = pkg.add_style(**pkg.get_style(sid))
+        assert pkg.get_style(clone) == pkg.get_style(sid)
+
+    def test_get_style_plain_base_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        decoded = pkg.get_style(0)  # fixture's base xf
+        assert decoded["number_format"] is None
+        assert decoded["bold"] is False
+        assert decoded["fill_color"] is None
+
+    def test_get_style_builtin_numfmt_decoded(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_number_format("0.00")  # loads styles into trees
+        cell_xfs = pkg.trees["xl/styles.xml"].getroot().find(f"{{{NS}}}cellXfs")
+        xf = ET.SubElement(cell_xfs, f"{{{NS}}}xf")
+        for attr, val in (("numFmtId", "9"), ("fontId", "0"), ("fillId", "0"),
+                          ("borderId", "0"), ("xfId", "0")):
+            xf.set(attr, val)
+        cell_xfs.set("count", str(len(cell_xfs)))
+        assert pkg.get_style(len(cell_xfs) - 1)["number_format"] == "0%"
+
+    def test_get_style_raises_without_styles_part(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            pkg.get_style(0)
+
+
+class TestInsertRows:
+    def _f(self, pkg, ref):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        cell = root.find(f".//{{{NS}}}c[@r='{ref}']")
+        return None if cell is None else cell.find(f"{{{NS}}}f").text
+
+    def test_cells_and_table_below_shift(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        assert pkg.table_map["Bottom"]["range"] == ["A7", "B9"]
+        assert pkg.get_cell("Sheet1", "A7") == "x"  # was A5
+
+    def test_formulas_rewritten(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        assert self._f(pkg, "D1") == "SUM(A7:A9)"
+        assert self._f(pkg, "E1") == "A1+1"          # above insert point
+        assert self._f(pkg, "D4") == "$A$7"          # $ markers kept
+        assert self._f(pkg, "D5") == "Sheet2!A5"     # other sheet untouched
+
+    def test_straddling_range_grows(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "F1", formula="SUM(A1:A7)")
+        pkg.insert_rows("Sheet1", 4, 2)
+        assert self._f(pkg, "F1") == "SUM(A1:A9)"
+
+    def test_straddled_table_grows(self, tmp_path):
+        # Insert inside Bottom's data rows (A5:B7): row 6 is between 5 and 7.
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 6, 1)
+        assert pkg.table_map["Bottom"]["range"] == ["A5", "B8"]
+
+    def test_merges_shift_and_straddling_merge_grows(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.merge_cells("Sheet1", "D1:D5")
+        pkg.insert_rows("Sheet1", 3, 2)
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        refs = {m.get("ref") for m in root.find(f"{{{NS}}}mergeCells")}
+        assert "A7:B7" in refs   # A5:B5 shifted
+        assert "D1:D7" in refs   # straddling merge grew
+
+    def test_row_height_rides_along(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.set_row_height("Sheet1", 5, 33)
+        pkg.insert_rows("Sheet1", 2, 3)
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f".//{{{NS}}}row[@r='8']").get("ht") == "33"
+
+    def test_named_ranges_shift(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        names = {n.get("name"): n.text
+                 for n in pkg.trees["xl/workbook.xml"].getroot()
+                 .find(f"{{{NS}}}definedNames")}
+        assert names["BottomData"] == "Sheet1!$A$7:$A$9"
+        assert names["OtherSheet"] == "Sheet2!$A$5:$A$7"
+
+    def test_cfdv_regions_shift(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        sqrefs = {cf.get("sqref")
+                  for cf in root.findall(f"{{{NS}}}conditionalFormatting")}
+        assert "A7:B9" in sqrefs
+        dv = root.find(f".//{{{NS}}}dataValidation")
+        assert dv.get("sqref") == "A7:A9"
+        assert dv.find(f"{{{NS}}}formula1").text == "A7"
+
+    def test_save_roundtrip(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        reopened = XLSXPackage(out)
+        assert reopened.table_map["Bottom"]["range"] == ["A7", "B9"]
+        assert reopened.get_cell("Sheet1", "A7") == "x"
+
+
+class TestDeleteRows:
+    def _f(self, pkg, ref):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        cell = root.find(f".//{{{NS}}}c[@r='{ref}']")
+        return None if cell is None else cell.find(f"{{{NS}}}f").text
+
+    def test_undoes_insert(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.insert_rows("Sheet1", 4, 2)
+        pkg.delete_rows("Sheet1", 4, 2)
+        assert pkg.table_map["Bottom"]["range"] == ["A5", "B7"]
+        assert self._f(pkg, "D1") == "SUM(A5:A7)"
+        assert self._f(pkg, "B5") == "A5*2"
+
+    def test_range_clamped_and_table_shrunk(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.delete_rows("Sheet1", 6, 2)  # Bottom data rows
+        assert pkg.table_map["Bottom"]["range"] == ["A5", "B5"]
+        assert self._f(pkg, "D1") == "SUM(A5:A5)"
+
+    def test_single_ref_becomes_ref_error(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "F1", formula="A4*3")
+        pkg.delete_rows("Sheet1", 4, 1)
+        assert self._f(pkg, "F1") == "#REF!*3"
+
+    def test_header_guard(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.delete_rows("Sheet1", 5, 3)  # covers Bottom's header
+
+    def test_merge_inside_band_removed_others_kept(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.merge_cells("Sheet1", "D6:E7")
+        pkg.delete_rows("Sheet1", 6, 2)  # band swallows D6:E7 entirely
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        refs = {m.get("ref") for m in root.find(f"{{{NS}}}mergeCells")}
+        assert refs == {"A1:B1", "A5:B5"}  # swallowed merge gone, others kept
+
+    def test_table_below_band_shifts_up(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.delete_rows("Sheet1", 4, 1)  # gap row between Top and Bottom
+        assert pkg.table_map["Bottom"]["range"] == ["A4", "B6"]
+        assert pkg.table_map["Far"]["range"] == ["A8", "B10"]
+        assert pkg.get_cell("Sheet1", "A4") == "B"
+
+
+class TestInsertDeleteCols:
+    def _f(self, pkg, ref):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        cell = root.find(f".//{{{NS}}}c[@r='{ref}']")
+        return None if cell is None else cell.find(f"{{{NS}}}f").text
+
+    def test_insert_shifts_table_and_formulas(self, tmp_path):
+        pkg = XLSXPackage(make_hcollision_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "G1", formula="D1*2")
+        pkg.insert_cols("Sheet1", "C", 2)
+        assert pkg.table_map["Right"]["range"] == ["F1", "G3"]
+        assert pkg.table_map["Left"]["range"] == ["A1", "B3"]
+        assert self._f(pkg, "I1") == "F1*2"
+        assert pkg.get_cell("Sheet1", "F1") == "R"
+
+    def test_insert_shifts_width_entries(self, tmp_path):
+        pkg = XLSXPackage(make_hcollision_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", "D", 22)
+        pkg.insert_cols("Sheet1", "C", 2)
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        col = root.find(f"{{{NS}}}cols/{{{NS}}}col")
+        assert (col.get("min"), col.get("max")) == ("6", "6")  # D -> F
+
+    def test_delete_undoes_insert(self, tmp_path):
+        pkg = XLSXPackage(make_hcollision_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "G1", formula="D1*2")
+        pkg.insert_cols("Sheet1", "C", 2)
+        pkg.delete_cols("Sheet1", "C", 2)
+        assert pkg.table_map["Right"]["range"] == ["D1", "E3"]
+        assert self._f(pkg, "G1") == "D1*2"
+
+    def test_deleted_ref_becomes_ref_error(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "C1", formula="A1+1")
+        pkg.delete_cols("Sheet1", "A", 1)
+        assert self._f(pkg, "B1") == "#REF!+1"
+
+    def test_mid_table_insert_guard(self, tmp_path):
+        pkg = XLSXPackage(make_hcollision_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.insert_cols("Sheet1", "B", 1)  # inside Left A1:B3
+
+    def test_table_intersect_delete_guard(self, tmp_path):
+        pkg = XLSXPackage(make_hcollision_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.delete_cols("Sheet1", "D", 1)  # Right's first column
+
+    def test_column_index_accepts_int(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B1", value=7)
+        pkg.insert_cols("Sheet1", 0, 1)  # 0-based -> before column A
+        assert pkg.get_cell("Sheet1", "C1") == 7

@@ -74,6 +74,15 @@ pkg.add_table("Summary", "Totals", "A1:C10", ["Region", "Q1", "Q2"])
 pkg.remove_table("OldTable")
 pkg.remove_sheet("Scratch")
 
+# Insert / delete rows and columns — references follow, tables adjust
+pkg.insert_rows("Sheet1", 4, count=2)   # everything below shifts down
+pkg.delete_cols("Sheet1", "F")          # refs into F become #REF!, rest shift
+
+# Reuse or inspect existing styles
+tmpl = pkg.get_cell_style("Sheet1", "B2")            # raw id, always faithful
+pkg.update_cell("Sheet1", "B10", value=99, style_id=tmpl)
+pkg.get_style(tmpl)                                  # decoded add_style kwargs
+
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
