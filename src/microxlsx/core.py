@@ -1,6 +1,7 @@
 """
 Core functionality for MicroXLSX.
 """
+# pylint: disable=too-many-lines
 import re
 import zipfile
 import io
@@ -29,6 +30,7 @@ class XLSXPackage:
     """
     Represents an Excel (XLSX) package.
     """
+    # pylint: disable=too-many-instance-attributes
     NS = {
         'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
         'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
@@ -37,6 +39,15 @@ class XLSXPackage:
     }
     # Custom number-format ids must start at 164 (0-163 are reserved built-ins).
     CUSTOM_FMT_BASE = 164
+    REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    CT_WORKSHEET = ('application/vnd.openxmlformats-officedocument.'
+                    'spreadsheetml.worksheet+xml')
+    CT_TABLE = ('application/vnd.openxmlformats-officedocument.'
+                'spreadsheetml.table+xml')
+    REL_WORKSHEET = ('http://schemas.openxmlformats.org/officeDocument/'
+                     '2006/relationships/worksheet')
+    REL_TABLE = ('http://schemas.openxmlformats.org/officeDocument/'
+                 '2006/relationships/table')
 
     def __init__(self, filename):
         self.filename = filename
@@ -46,21 +57,26 @@ class XLSXPackage:
         self._shared_strings = None
         self._drop_calc_chain = False
         self._added_formats = {}
+        self._source_parts = set()
+        self._dropped_parts = set()
+        self._ct_add = {}
+        self._ct_remove = set()
         for prefix, uri in self.NS.items():
             ET.register_namespace(prefix if prefix != 'main' else '', uri)
         self._build_maps()
+
+    def _build_maps(self):
+        """Builds relationship maps for Sheets and Tables."""
+        with zipfile.ZipFile(self.filename, 'r') as zin:
+            self._source_parts = set(zin.namelist())
+            self._map_sheets(zin)
+            self._map_tables(zin)
 
     def _get_tree(self, zin, path):
         if path not in self.trees:
             with zin.open(path) as f:
                 self.trees[path] = ET.parse(f)
         return self.trees[path]
-
-    def _build_maps(self):
-        """Builds relationship maps for Sheets and Tables."""
-        with zipfile.ZipFile(self.filename, 'r') as zin:
-            self._map_sheets(zin)
-            self._map_tables(zin)
 
     def _map_sheets(self, zin):
         """Map Sheets to paths."""
@@ -77,7 +93,7 @@ class XLSXPackage:
     def _map_tables(self, zin):
         """Map Tables to metadata."""
         for sheet_name, sheet_path in self.sheet_map.items():
-            rel_path = f"xl/worksheets/_rels/{sheet_path.split('/')[-1]}.rels"
+            rel_path = f"xl/worksheets/_rels/{sheet_path.rsplit('/', maxsplit=1)[-1]}.rels"
             try:
                 with zin.open(rel_path) as f:
                     t_rel_tree = ET.parse(f)
@@ -89,7 +105,7 @@ class XLSXPackage:
 
     def _parse_table_rel(self, zin, sheet_name, rel):
         """Helper to parse table relationship."""
-        t_path = f"xl/tables/{rel.get('Target').split('/')[-1]}"
+        t_path = f"xl/tables/{rel.get('Target').rsplit('/', maxsplit=1)[-1]}"
         t_tree = self._get_tree(zin, t_path)
         t_root = t_tree.getroot()
         t_name, t_ref = t_root.get('displayName'), t_root.get('ref')
@@ -189,6 +205,170 @@ class XLSXPackage:
         row_el = self._row_get_or_create(sheet_data, int(row))
         row_el.set('ht', str(height))
         row_el.set('customHeight', '1')
+
+    def add_sheet(self, name):
+        """Create a new empty worksheet and return its name."""
+        ns = self.NS['main']
+        if name in self.sheet_map:
+            raise ValueError(f"sheet '{name}' already exists")
+        part = f"xl/worksheets/sheet{self._next_part_number('xl/worksheets/sheet')}.xml"
+        self.trees[part] = ET.ElementTree(
+            ET.fromstring(f'<worksheet xmlns="{ns}"><sheetData/></worksheet>'))
+        rid = self._add_workbook_rel(
+            self.REL_WORKSHEET, f"worksheets/{part.rsplit('/', maxsplit=1)[-1]}")
+        sheets = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}sheets")
+        sheet_ids = [int(s.get('sheetId')) for s in sheets if s.get('sheetId')]
+        sheet_el = ET.SubElement(sheets, f"{{{ns}}}sheet")
+        sheet_el.set('name', name)
+        sheet_el.set('sheetId', str(max(sheet_ids, default=0) + 1))
+        sheet_el.set(f"{{{self.NS['r']}}}id", rid)
+        self._ct_add[f"/{part}"] = self.CT_WORKSHEET
+        self.sheet_map[name] = part
+        return name
+
+    def remove_sheet(self, name):
+        """Remove a worksheet, its relationship, and any tables it holds."""
+        ns = self.NS['main']
+        if name not in self.sheet_map:
+            raise KeyError(name)
+        if len(self.sheet_map) == 1:
+            raise ValueError("cannot remove the only sheet")
+        path = self.sheet_map[name]
+        sheets = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}sheets")
+        sheet_el = next(s for s in sheets if s.get('name') == name)
+        rid = sheet_el.get(f"{{{self.NS['r']}}}id")
+        sheets.remove(sheet_el)
+        self._remove_workbook_rel(rid)
+        self._drop_part(path)
+        self._ct_remove.add(f"/{path}")
+        self._drop_part(self._sheet_rels_path(path))
+        for table in [t for t, m in self.table_map.items() if m['sheet'] == name]:
+            self._drop_table_part(table)
+        del self.sheet_map[name]
+
+    # pylint: disable=too-many-locals
+    def add_table(self, sheet_name, name, ref, columns):
+        """Create a table over ``ref`` on a sheet with the given column names."""
+        ns = self.NS['main']
+        if name in self.table_map:
+            raise ValueError(f"table '{name}' already exists")
+        part = f"xl/tables/table{self._next_part_number('xl/tables/table')}.xml"
+        cols = ''.join(f'<tableColumn id="{i + 1}" name="{c}"/>'
+                       for i, c in enumerate(columns))
+        self.trees[part] = ET.ElementTree(ET.fromstring(
+            f'<table xmlns="{ns}" id="{self._next_table_id()}" name="{name}"'
+            f' displayName="{name}" ref="{ref}">'
+            f'<tableColumns count="{len(columns)}">{cols}</tableColumns></table>'))
+        rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[sheet_name]))
+        rid = self._next_rid(rels.getroot())
+        rel = ET.SubElement(rels.getroot(), f"{{{self.REL_NS}}}Relationship")
+        rel.set('Id', rid)
+        rel.set('Type', self.REL_TABLE)
+        rel.set('Target', f"../tables/{part.rsplit('/', maxsplit=1)[-1]}")
+        sheet_root = self._sheet_root(sheet_name)
+        table_parts = sheet_root.find(f"{{{ns}}}tableParts")
+        if table_parts is None:
+            table_parts = ET.SubElement(sheet_root, f"{{{ns}}}tableParts")
+        ET.SubElement(table_parts, f"{{{ns}}}tablePart").set(f"{{{self.NS['r']}}}id", rid)
+        table_parts.set('count', str(len(table_parts)))
+        self._ct_add[f"/{part}"] = self.CT_TABLE
+        start_cell, end_cell = ref.split(':')
+        self.table_map[name] = {
+            'xml_path': part, 'sheet': sheet_name,
+            'range': [start_cell, end_cell],
+            'start_indices': cell_to_indices(start_cell),
+            'columns': {c: i for i, c in enumerate(columns)},
+        }
+        return name
+
+    def remove_table(self, name):
+        """Remove a table part and its worksheet/relationship references."""
+        ns = self.NS['main']
+        meta = self.table_map[name]
+        table_file = meta['xml_path'].rsplit('/', maxsplit=1)[-1]
+        rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[meta['sheet']]))
+        rid = None
+        for rel in rels.getroot().findall(f"{{{self.REL_NS}}}Relationship"):
+            if rel.get('Target', '').endswith(table_file):
+                rid = rel.get('Id')
+                rels.getroot().remove(rel)
+                break
+        sheet_root = self._sheet_root(meta['sheet'])
+        table_parts = sheet_root.find(f"{{{ns}}}tableParts")
+        if table_parts is not None:
+            for part in table_parts.findall(f"{{{ns}}}tablePart"):
+                if part.get(f"{{{self.NS['r']}}}id") == rid:
+                    table_parts.remove(part)
+            table_parts.set('count', str(len(table_parts)))
+            if len(table_parts) == 0:
+                sheet_root.remove(table_parts)
+        self._drop_table_part(name)
+
+    def _drop_table_part(self, name):
+        """Drop a table's part + content type and forget it."""
+        meta = self.table_map.pop(name)
+        self._drop_part(meta['xml_path'])
+        self._ct_remove.add(f"/{meta['xml_path']}")
+
+    def _drop_part(self, path):
+        """Mark a part for removal on save and evict any cached tree."""
+        self._dropped_parts.add(path)
+        self.trees.pop(path, None)
+
+    @staticmethod
+    def _sheet_rels_path(sheet_path):
+        """Return the .rels path for a worksheet part."""
+        return f"xl/worksheets/_rels/{sheet_path.rsplit('/', maxsplit=1)[-1]}.rels"
+
+    def _next_part_number(self, prefix):
+        """Return the next free integer for ``{prefix}N.xml`` part names."""
+        pattern = re.compile(re.escape(prefix) + r'(\d+)\.xml$')
+        candidates = (self._source_parts | set(self.trees)) - self._dropped_parts
+        nums = [int(m.group(1)) for m in map(pattern.search, candidates) if m]
+        return max(nums, default=0) + 1
+
+    def _next_table_id(self):
+        """Return a workbook-unique table id."""
+        ids = [int(tree.getroot().get('id'))
+               for path, tree in self.trees.items()
+               if path.startswith('xl/tables/') and tree.getroot().get('id')]
+        return max(ids, default=0) + 1
+
+    def _next_rid(self, rels_root):
+        """Return the next free ``rIdN`` for a relationships tree."""
+        nums = [int(r.get('Id')[3:]) for r in rels_root.findall(f"{{{self.REL_NS}}}Relationship")
+                if (r.get('Id') or '').startswith('rId')]
+        return f"rId{max(nums, default=0) + 1}"
+
+    def _add_workbook_rel(self, rel_type, target):
+        """Append a relationship to the workbook rels tree; return its id."""
+        root = self.trees['xl/_rels/workbook.xml.rels'].getroot()
+        rid = self._next_rid(root)
+        rel = ET.SubElement(root, f"{{{self.REL_NS}}}Relationship")
+        rel.set('Id', rid)
+        rel.set('Type', rel_type)
+        rel.set('Target', target)
+        return rid
+
+    def _remove_workbook_rel(self, rid):
+        """Remove a workbook relationship by id."""
+        root = self.trees['xl/_rels/workbook.xml.rels'].getroot()
+        for rel in root.findall(f"{{{self.REL_NS}}}Relationship"):
+            if rel.get('Id') == rid:
+                root.remove(rel)
+
+    def _get_or_create_rels(self, rels_path):
+        """Return a worksheet rels tree, creating an empty one if absent."""
+        if rels_path in self.trees:
+            return self.trees[rels_path]
+        try:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                return self._get_tree(zin, rels_path)
+        except KeyError:
+            tree = ET.ElementTree(ET.fromstring(
+                f'<Relationships xmlns="{self.REL_NS}"/>'))
+            self.trees[rels_path] = tree
+            return tree
 
     def merge_cells(self, sheet_name, cell_range):
         """Adds a merge rule to the worksheet."""
@@ -851,32 +1031,58 @@ class XLSXPackage:
         row.insert(idx, cell)
 
     def save(self, output_path):
-        """Preservation Loop."""
-        drop = self._drop_calc_chain
-        if drop:
+        """Preservation Loop: re-serialize edited parts, add new, drop removed."""
+        if self._drop_calc_chain:
             # workbook rels live in self.trees (loaded for sheet mapping), so
             # drop the calcChain relationship there; [Content_Types].xml is
             # streamed, so it is patched on the raw bytes below.
             self._strip_calc_chain_relationship()
+        dropped = set(self._dropped_parts)
+        if self._drop_calc_chain:
+            dropped.add('xl/calcChain.xml')
+        written = set()
         with zipfile.ZipFile(self.filename, 'r') as zin:
             with zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
                     name = item.filename
-                    if drop and name == 'xl/calcChain.xml':
-                        continue  # stale after formula edits; Excel rebuilds it
+                    if name in dropped:
+                        continue
+                    written.add(name)
                     if name in self.trees:
-                        buf = io.BytesIO()
-                        buf.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n')
-                        self.trees[name].write(buf, encoding='utf-8', xml_declaration=False)
-                        zout.writestr(name, buf.getvalue())
-                    elif drop and name == '[Content_Types].xml':
-                        data = re.sub(
-                            rb'<Override\b[^>]*?PartName="/xl/calcChain\.xml"[^>]*?/>',
-                            b'', zin.read(name)
-                        )
-                        zout.writestr(item, data)
+                        zout.writestr(name, self._serialize_tree(name))
+                    elif name == '[Content_Types].xml':
+                        zout.writestr(item, self._patch_content_types(zin.read(name)))
                     else:
                         zout.writestr(item, zin.read(name))
+                # Parts created this session (in trees but not in the source).
+                for name in self.trees:
+                    if name not in written and name not in dropped:
+                        zout.writestr(name, self._serialize_tree(name))
+
+    def _serialize_tree(self, name):
+        """Serialize a cached tree with the standard XML declaration."""
+        buf = io.BytesIO()
+        buf.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n')
+        self.trees[name].write(buf, encoding='utf-8', xml_declaration=False)
+        return buf.getvalue()
+
+    def _patch_content_types(self, data):
+        """Apply pending Override add/remove edits to [Content_Types].xml bytes."""
+        removals = set(self._ct_remove)
+        if self._drop_calc_chain:
+            removals.add('/xl/calcChain.xml')
+        for part in removals:
+            data = re.sub(
+                rb'<Override\b[^>]*?PartName="' + re.escape(part).encode()
+                + rb'"[^>]*?/>',
+                b'', data)
+        additions = b''.join(
+            b'<Override PartName="%s" ContentType="%s"/>'
+            % (part.encode(), content_type.encode())
+            for part, content_type in self._ct_add.items())
+        if additions:
+            data = data.replace(b'</Types>', additions + b'</Types>')
+        return data
 
     def _strip_calc_chain_relationship(self):
         """Remove the calcChain relationship from the workbook rels tree."""

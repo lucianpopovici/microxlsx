@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Structural operations: `add_sheet(name)`, `remove_sheet(name)` (removes its
+  tables too; refuses to remove the last sheet), `add_table(sheet, name, ref,
+  columns)`, and `remove_table(name)`. These maintain `[Content_Types].xml`
+  overrides, workbook/worksheet relationships, `tableParts`, and part files, and
+  `save` now writes newly created parts and omits removed ones.
 - Inspection helpers: `sheet_names()`, `table_names()`, and
   `table_dimensions(table_name)` (rows × cols, header included).
 - `clear_cell(sheet_name, cell_ref)` — remove a cell (the row is kept) and flag
