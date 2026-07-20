@@ -200,7 +200,7 @@ class XLSXPackage:
         """Set a column's width. ``column`` is a letter (``"A"``) or 0-based int."""
         ns = self.NS['main']
         root = self._sheet_root(sheet_name)
-        idx = column if isinstance(column, int) else cell_to_indices(f"{column}1")[1]
+        idx = self._col_index(column)
         num = str(idx + 1)  # <col> uses 1-based min/max
         cols = root.find(f"{{{ns}}}cols")
         if cols is None:
@@ -390,6 +390,378 @@ class XLSXPackage:
                 f'<Relationships xmlns="{self.REL_NS}"/>'))
             self.trees[rels_path] = tree
             return tree
+
+    @staticmethod
+    def _col_index(column):
+        """Accept a column letter (``"C"``) or 0-based int; return the index."""
+        return column if isinstance(column, int) else cell_to_indices(f"{column}1")[1]
+
+    def insert_rows(self, sheet_name, row, count=1):
+        """Insert ``count`` blank rows above 1-based ``row``.
+
+        Everything at/below shifts down: cell data, row heights, merges,
+        conditional formatting, data validation, formulas, named ranges, and
+        tables (a table straddling the insertion point grows, one below it
+        moves).
+        """
+        self._insert_axis(sheet_name, row - 1, count, 0)
+
+    def insert_cols(self, sheet_name, column, count=1):
+        """Insert ``count`` blank columns before ``column`` (letter or 0-based).
+
+        Raises ``ValueError`` if the insertion point cuts through a table's
+        column span — use ``resize_table`` to widen a table.
+        """
+        self._insert_axis(sheet_name, self._col_index(column), count, 1)
+
+    def delete_rows(self, sheet_name, row, count=1):
+        """Delete ``count`` rows starting at 1-based ``row``.
+
+        Rows below shift up. References into the deleted band become
+        ``#REF!`` (single cells) or are clamped (ranges); merges and
+        CF/validation regions fully inside it are removed. A table whose
+        header row is in the band raises ``ValueError`` (use
+        ``remove_table``); its data rows just shrink the table.
+        """
+        self._delete_axis(sheet_name, row - 1, count, 0)
+
+    def delete_cols(self, sheet_name, column, count=1):
+        """Delete ``count`` columns starting at ``column`` (letter or 0-based).
+
+        Raises ``ValueError`` if the band intersects a table's column span —
+        use ``resize_table``/``remove_table`` for tables.
+        """
+        self._delete_axis(sheet_name, self._col_index(column), count, 1)
+
+    def _insert_axis(self, sheet_name, pos, count, axis):
+        """Shared insert implementation: shift at/after ``pos`` by ``count``."""
+        if pos < 0 or count < 1:
+            raise ValueError("position must be >= first row/column, count >= 1")
+        root = self._sheet_root(sheet_name)
+        self._adjust_tables_insert(sheet_name, pos, count, axis)
+        self._shift_cells_from(root, pos, count, axis)
+        if axis == 1:
+            self._shift_col_widths(root, lambda mn, mx: (
+                mn + count if mn >= pos else mn,
+                mx + count if mx >= pos else mx))
+
+        def single(rc):
+            if rc[axis] < pos:
+                return rc
+            return self._bump(rc, axis, count)
+
+        self._rewrite_sheet_refs(
+            sheet_name, root, single=single,
+            pair=lambda a, b: (single(a), single(b)))
+        self._invalidate_calc_cache()
+
+    def _delete_axis(self, sheet_name, pos, count, axis):
+        """Shared delete implementation for the band ``[pos, pos+count-1]``."""
+        if pos < 0 or count < 1:
+            raise ValueError("position must be >= first row/column, count >= 1")
+        band_start, band_end = pos, pos + count - 1
+        root = self._sheet_root(sheet_name)
+        self._adjust_tables_delete(sheet_name, band_start, band_end, axis)
+        self._remove_cells_band(root, band_start, band_end, axis)
+        if axis == 1:
+            def width_pair(mn, mx):
+                pair = self._clamp_interval(mn, mx, band_start, band_end, count)
+                return pair if pair else None
+            self._shift_col_widths(root, width_pair)
+
+        def single(rc):
+            v = rc[axis]
+            if v < band_start:
+                return rc
+            if v <= band_end:
+                return None
+            return self._bump(rc, axis, -count)
+
+        def pair(a, b):
+            clamped = self._clamp_interval(
+                a[axis], b[axis], band_start, band_end, count)
+            if clamped is None:
+                return None
+            new_a, new_b = list(a), list(b)
+            new_a[axis], new_b[axis] = clamped
+            return tuple(new_a), tuple(new_b)
+
+        self._rewrite_sheet_refs(sheet_name, root, single=single, pair=pair)
+        self._invalidate_calc_cache()
+
+    @staticmethod
+    def _bump(rc, axis, delta):
+        """Return ``rc`` with its ``axis`` coordinate shifted by ``delta``."""
+        moved = list(rc)
+        moved[axis] += delta
+        return tuple(moved)
+
+    @staticmethod
+    def _clamp_interval(start, end, band_start, band_end, count):
+        """Shrink/shift an interval for a deleted band; None when swallowed."""
+        def move(value, floor):
+            if value < band_start:
+                return value
+            if value <= band_end:
+                return floor
+            return value - count
+        new_start = move(start, band_start)
+        new_end = move(end, band_start - 1)
+        return None if new_end < new_start else (new_start, new_end)
+
+    def _adjust_tables_insert(self, sheet_name, pos, count, axis):
+        """Shift/grow tables for an insert; reject mid-table column inserts."""
+        for name, meta in self.table_map.items():
+            if meta['sheet'] != sheet_name:
+                continue
+            top, left = meta['start_indices']
+            bottom, right = cell_to_indices(meta['range'][1])
+            lead, trail = (top, bottom) if axis == 0 else (left, right)
+            if pos <= lead:
+                lead, trail = lead + count, trail + count
+            elif pos <= trail:
+                if axis == 1:
+                    raise ValueError(
+                        f"insert_cols cuts through table '{name}'; "
+                        f"use resize_table to widen it")
+                trail += count  # rows inserted inside the table grow it
+            else:
+                continue
+            if axis == 0:
+                top, bottom = lead, trail
+            else:
+                left, right = lead, trail
+            self._set_table_box(meta, (top, left, bottom, right))
+
+    def _adjust_tables_delete(self, sheet_name, band_start, band_end, axis):
+        """Shift/shrink tables for a delete; validate before mutating."""
+        plans = []
+        for name, meta in self.table_map.items():
+            if meta['sheet'] != sheet_name:
+                continue
+            top, left = meta['start_indices']
+            bottom, right = cell_to_indices(meta['range'][1])
+            lead, trail = (top, bottom) if axis == 0 else (left, right)
+            count = band_end - band_start + 1
+            if band_end < lead:
+                plans.append((meta, -count, 0))
+            elif band_start > trail:
+                continue
+            elif axis == 1:
+                raise ValueError(
+                    f"delete_cols intersects table '{name}'; "
+                    f"use resize_table or remove_table")
+            elif band_start <= lead:
+                raise ValueError(
+                    f"delete_rows would remove the header of '{name}'; "
+                    f"use remove_table first")
+            else:
+                overlap = min(trail, band_end) - band_start + 1
+                plans.append((meta, 0, -overlap))
+        for meta, lead_delta, trail_delta in plans:
+            top, left = meta['start_indices']
+            bottom, right = cell_to_indices(meta['range'][1])
+            if axis == 0:
+                top, bottom = top + lead_delta, bottom + lead_delta + trail_delta
+            else:
+                left, right = left + lead_delta, right + lead_delta + trail_delta
+            self._set_table_box(meta, (top, left, bottom, right))
+
+    def _set_table_box(self, meta, box):
+        """Update a table's metadata + XML ref to a new bounding box."""
+        top, left, bottom, right = box
+        meta['start_indices'] = (top, left)
+        meta['range'] = [indices_to_cell(top, left), indices_to_cell(bottom, right)]
+        self.trees[meta['xml_path']].getroot().set(
+            'ref', f"{meta['range'][0]}:{meta['range'][1]}")
+
+    def _shift_cells_from(self, root, pos, count, axis):
+        """Physically shift all cells at/after ``pos`` along ``axis``."""
+        ns = self.NS['main']
+        for row in root.find(f".//{{{ns}}}sheetData"):
+            row_idx = int(row.get('r')) - 1
+            if axis == 0 and row_idx >= pos:
+                row.set('r', str(row_idx + count + 1))
+                row.attrib.pop('spans', None)
+                for cell in row:
+                    r_i, c_i = cell_to_indices(cell.get('r'))
+                    cell.set('r', indices_to_cell(r_i + count, c_i))
+            elif axis == 1:
+                for cell in row:
+                    r_i, c_i = cell_to_indices(cell.get('r'))
+                    if c_i >= pos:
+                        cell.set('r', indices_to_cell(r_i, c_i + count))
+
+    def _remove_cells_band(self, root, band_start, band_end, axis):
+        """Remove cells in the deleted band and close the gap after it."""
+        ns = self.NS['main']
+        count = band_end - band_start + 1
+        sheet_data = root.find(f".//{{{ns}}}sheetData")
+        for row in list(sheet_data):
+            row_idx = int(row.get('r')) - 1
+            if axis == 0:
+                if band_start <= row_idx <= band_end:
+                    sheet_data.remove(row)
+                elif row_idx > band_end:
+                    row.set('r', str(row_idx - count + 1))
+                    row.attrib.pop('spans', None)
+                    for cell in row:
+                        r_i, c_i = cell_to_indices(cell.get('r'))
+                        cell.set('r', indices_to_cell(r_i - count, c_i))
+            else:
+                for cell in list(row):
+                    c_i = cell_to_indices(cell.get('r'))[1]
+                    if band_start <= c_i <= band_end:
+                        row.remove(cell)
+                    elif c_i > band_end:
+                        r_i = cell_to_indices(cell.get('r'))[0]
+                        cell.set('r', indices_to_cell(r_i, c_i - count))
+
+    def _shift_col_widths(self, root, transform):
+        """Apply ``transform(min, max)`` (0-based) to each ``<col>`` entry."""
+        ns = self.NS['main']
+        cols = root.find(f"{{{ns}}}cols")
+        if cols is None:
+            return
+        for col in list(cols):
+            moved = transform(int(col.get('min')) - 1, int(col.get('max')) - 1)
+            if moved is None:
+                cols.remove(col)
+            else:
+                col.set('min', str(moved[0] + 1))
+                col.set('max', str(moved[1] + 1))
+        if len(cols) == 0:
+            root.remove(cols)
+
+    def _rewrite_sheet_refs(self, sheet_name, root, *, single, pair):
+        """Apply endpoint transforms to every reference tied to a sheet."""
+        ns = self.NS['main']
+        for f_node in root.iter(f"{{{ns}}}f"):
+            if f_node.text:
+                f_node.text = self._transform_refs(
+                    f_node.text, sheet_name, single=single, pair=pair)
+            if f_node.get('ref'):
+                moved = self._transform_plain_range(f_node.get('ref'), pair)
+                if moved is None:
+                    f_node.attrib.pop('ref')
+                else:
+                    f_node.set('ref', moved)
+        merge_cells = root.find(f"{{{ns}}}mergeCells")
+        if merge_cells is not None:
+            for merge in list(merge_cells):
+                moved = self._transform_plain_range(merge.get('ref'), pair)
+                if moved is None:
+                    merge_cells.remove(merge)
+                else:
+                    merge.set('ref', moved)
+            merge_cells.set('count', str(len(merge_cells)))
+            if len(merge_cells) == 0:
+                root.remove(merge_cells)
+        self._transform_range_features(root, sheet_name, single=single, pair=pair)
+        self._transform_defined_names(sheet_name, single=single, pair=pair)
+
+    def _transform_range_features(self, root, sheet_name, *, single, pair):
+        """Transform CF/data-validation regions + rule formulas; drop empties."""
+        ns = self.NS['main']
+        for cf_node in list(root.findall(f"{{{ns}}}conditionalFormatting")):
+            if not self._transform_sqref(cf_node, pair):
+                root.remove(cf_node)
+                continue
+            for formula in cf_node.iter(f"{{{ns}}}formula"):
+                if formula.text:
+                    formula.text = self._transform_refs(
+                        formula.text, sheet_name, single=single, pair=pair)
+        validations = root.find(f"{{{ns}}}dataValidations")
+        if validations is not None:
+            for dv_node in list(validations.findall(f"{{{ns}}}dataValidation")):
+                if not self._transform_sqref(dv_node, pair):
+                    validations.remove(dv_node)
+                    continue
+                for tag in ('formula1', 'formula2'):
+                    node = dv_node.find(f"{{{ns}}}{tag}")
+                    if node is not None and node.text:
+                        node.text = self._transform_refs(
+                            node.text, sheet_name, single=single, pair=pair)
+            validations.set('count', str(len(validations)))
+            if len(validations) == 0:
+                root.remove(validations)
+
+    def _transform_sqref(self, elem, pair):
+        """Transform a space-separated ``sqref``; False when nothing is left."""
+        parts = []
+        for part in (elem.get('sqref') or '').split():
+            moved = self._transform_plain_range(part, pair)
+            if moved is not None:
+                parts.append(moved)
+        if not parts:
+            return False
+        elem.set('sqref', ' '.join(parts))
+        return True
+
+    def _transform_defined_names(self, sheet_name, *, single, pair):
+        """Transform workbook defined names tied to ``sheet_name``."""
+        ns = self.NS['main']
+        names = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}definedNames")
+        if names is None:
+            return
+        for name in names.findall(f"{{{ns}}}definedName"):
+            if name.text:
+                name.text = self._transform_refs(
+                    name.text, sheet_name, single=single, pair=pair)
+
+    @staticmethod
+    def _transform_plain_range(ref, pair):
+        """Transform an unqualified cell/range ref; None when swallowed."""
+        parts = ref.split(':')
+        start = cell_to_indices(parts[0])
+        end = cell_to_indices(parts[-1])
+        moved = pair(start, end)
+        if moved is None:
+            return None
+        new_start, new_end = moved
+        if len(parts) == 1 and new_start == new_end:
+            return indices_to_cell(*new_start)
+        return f"{indices_to_cell(*new_start)}:{indices_to_cell(*new_end)}"
+
+    def _transform_refs(self, text, sheet_name, *, single, pair):
+        """Endpoint-transform every A1 reference in a formula-like string."""
+
+        # pylint: disable=too-many-return-statements
+        def repl(match):
+            start = match.start()
+            if start > 0 and (text[start - 1].isalnum() or text[start - 1] == '_'):
+                return match.group(0)  # part of a longer name
+            sheet = match.group('sheet')
+            if sheet and sheet[:-1].strip("'") != sheet_name:
+                return match.group(0)  # a different sheet
+            end_a, end_b = match.group('a'), match.group('b')
+            if end_b is None:
+                if match.end() < len(text) and text[match.end()] == '(':
+                    return match.group(0)  # a function call
+                moved = single(self._endpoint_rc(end_a))
+                if moved is None:
+                    return '#REF!'
+                return f"{sheet or ''}{self._endpoint_str(end_a, moved)}"
+            moved = pair(self._endpoint_rc(end_a), self._endpoint_rc(end_b))
+            if moved is None:
+                return '#REF!'
+            return (f"{sheet or ''}{self._endpoint_str(end_a, moved[0])}:"
+                    f"{self._endpoint_str(end_b, moved[1])}")
+
+        return _RANGE_RE.sub(repl, text)
+
+    @staticmethod
+    def _endpoint_rc(endpoint):
+        """Parse a ``$A$5``-style endpoint to 0-based (row, col)."""
+        return cell_to_indices(endpoint.replace('$', ''))
+
+    @staticmethod
+    def _endpoint_str(original, rc):
+        """Rebuild an endpoint at ``rc`` preserving its ``$`` markers."""
+        markers = re.match(r"(\$?)[A-Za-z]{1,3}(\$?)[0-9]+", original)
+        plain = re.match(r"([A-Z]+)([0-9]+)", indices_to_cell(*rc))
+        return (f"{markers.group(1)}{plain.group(1)}"
+                f"{markers.group(2)}{plain.group(2)}")
 
     def merge_cells(self, sheet_name, cell_range):
         """Adds a merge rule to the worksheet."""

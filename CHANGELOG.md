@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `insert_rows` / `delete_rows` / `insert_cols` / `delete_cols` — structural
+  edits mid-sheet. Cell data, row heights, column widths, merges,
+  conditional-formatting and data-validation regions, formulas, and named
+  ranges all shift; ranges straddling an insertion point grow, and a table
+  straddling it grows too (a table below/right of it moves). On delete,
+  references into the removed band become `#REF!` (single cells) or are
+  clamped (ranges); merges/regions swallowed by the band are removed.
+  Guards: deleting a table's header row or inserting/deleting through a
+  table's column span raises `ValueError` (use
+  `resize_table`/`remove_table`).
+- `get_cell_style(sheet, ref)` — a cell's raw `style_id` for faithful reuse —
+  and `get_style(style_id)` — best-effort decode into `add_style`-compatible
+  kwargs (theme colors and mixed borders come back as raw dicts).
 - Bulk range operations: `write_range(sheet, start_ref, rows)` writes a 2D
   block in a single tree pass (`None` entries leave cells untouched),
   `get_range(sheet, ref)` reads a rectangle as lists (missing cells → `None`),
