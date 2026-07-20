@@ -20,6 +20,17 @@ _BUILTIN_DATE_FMTS = frozenset(
     + list(range(50, 59))
 )
 
+# Format codes for the common built-in number-format ids (ECMA-376 §18.8.30).
+_BUILTIN_FMT_CODES = {
+    0: 'General', 1: '0', 2: '0.00', 3: '#,##0', 4: '#,##0.00',
+    9: '0%', 10: '0.00%', 11: '0.00E+00', 12: '# ?/?', 13: '# ??/??',
+    14: 'm/d/yyyy', 15: 'd-mmm-yy', 16: 'd-mmm', 17: 'mmm-yy',
+    18: 'h:mm AM/PM', 19: 'h:mm:ss AM/PM', 20: 'h:mm', 21: 'h:mm:ss',
+    22: 'm/d/yyyy h:mm', 37: '#,##0;(#,##0)', 38: '#,##0;[Red](#,##0)',
+    39: '#,##0.00;(#,##0.00)', 40: '#,##0.00;[Red](#,##0.00)',
+    45: 'mm:ss', 46: '[h]:mm:ss', 47: 'mm:ss.0', 48: '##0.0E+0', 49: '@',
+}
+
 # A1-style reference: optional 'Sheet'! qualifier, optional $ absolute markers.
 _CELL_REF_RE = re.compile(
     r"(?P<sheet>(?:'[^']+'|[A-Za-z0-9_.]+)!)?"
@@ -620,6 +631,122 @@ class XLSXPackage:
         """Normalize ``"RRGGBB"``/``"#RRGGBB"``/8-digit ARGB to ARGB hex."""
         color = color.lstrip('#').upper()
         return color if len(color) == 8 else f"FF{color}"
+
+    def get_cell_style(self, sheet_name, cell_ref):
+        """Return a cell's ``style_id`` (reusable as-is), or None if unstyled.
+
+        Unlike ``get_style``, this never decodes anything, so reuse via
+        ``update_cell(style_id=...)`` is always faithful to the original.
+        """
+        ns = self.NS['main']
+        path = self.sheet_map.get(sheet_name, sheet_name)
+        if path in self.trees:
+            root = self.trees[path].getroot()
+        else:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                with zin.open(path) as handle:
+                    root = ET.parse(handle).getroot()
+        cell = root.find(f".//{{{ns}}}c[@r='{cell_ref}']")
+        if cell is None or cell.get('s') is None:
+            return None
+        return int(cell.get('s'))
+
+    def get_style(self, style_id):
+        """Decode a style into ``add_style``-compatible kwargs (best effort).
+
+        Returns a dict with keys ``number_format``, ``bold``, ``italic``,
+        ``font_size``, ``font_name``, ``font_color``, ``fill_color``,
+        ``border``, ``align``, ``valign``, ``wrap``. Theme colors decode to
+        ``{'theme': n, 'tint': t}`` dicts and a mixed border to a per-side
+        dict — neither is re-feedable to ``add_style``; unknown built-in
+        number formats decode to None. For faithful reuse of any style, pass
+        the raw id from ``get_cell_style`` instead.
+        """
+        root = self._styles_root_readonly()
+        if root is None:
+            raise FileNotFoundError("xl/styles.xml not found")
+        ns = self.NS['main']
+        xf_node = root.find(f"{{{ns}}}cellXfs")[style_id]
+        out = {'number_format': self._decode_numfmt(root, xf_node),
+               'bold': False, 'italic': False, 'font_size': None,
+               'font_name': None, 'font_color': None, 'fill_color': None,
+               'border': None, 'align': None, 'valign': None, 'wrap': False}
+        self._decode_font(root, xf_node, out)
+        self._decode_fill_border(root, xf_node, out)
+        alignment = xf_node.find(f"{{{ns}}}alignment")
+        if alignment is not None:
+            out['align'] = alignment.get('horizontal')
+            out['valign'] = alignment.get('vertical')
+            out['wrap'] = alignment.get('wrapText') == '1'
+        return out
+
+    def _decode_numfmt(self, root, xf_node):
+        """Resolve an xf's numFmtId to its format code where known."""
+        ns = self.NS['main']
+        fmt_id = int(xf_node.get('numFmtId', '0'))
+        if fmt_id == 0:
+            return None
+        for fmts in root.findall(f"{{{ns}}}numFmts"):
+            for entry in fmts.findall(f"{{{ns}}}numFmt"):
+                if int(entry.get('numFmtId')) == fmt_id:
+                    return entry.get('formatCode')
+        return _BUILTIN_FMT_CODES.get(fmt_id)
+
+    def _decode_font(self, root, xf_node, out):
+        """Fill font-related keys of a decoded style dict."""
+        ns = self.NS['main']
+        fonts = root.find(f"{{{ns}}}fonts")
+        idx = int(xf_node.get('fontId', '0'))
+        if fonts is None or idx >= len(fonts):
+            return
+        font = fonts[idx]
+        out['bold'] = font.find(f"{{{ns}}}b") is not None
+        out['italic'] = font.find(f"{{{ns}}}i") is not None
+        size = font.find(f"{{{ns}}}sz")
+        if size is not None:
+            out['font_size'] = float(size.get('val'))
+        name = font.find(f"{{{ns}}}name")
+        if name is not None:
+            out['font_name'] = name.get('val')
+        out['font_color'] = self._decode_color(font.find(f"{{{ns}}}color"))
+
+    def _decode_fill_border(self, root, xf_node, out):
+        """Fill fill/border keys of a decoded style dict."""
+        ns = self.NS['main']
+        fills = root.find(f"{{{ns}}}fills")
+        fill_idx = int(xf_node.get('fillId', '0'))
+        if fills is not None and fill_idx < len(fills):
+            pattern = fills[fill_idx].find(f"{{{ns}}}patternFill")
+            if pattern is not None and pattern.get('patternType') == 'solid':
+                out['fill_color'] = self._decode_color(
+                    pattern.find(f"{{{ns}}}fgColor"))
+        borders = root.find(f"{{{ns}}}borders")
+        border_idx = int(xf_node.get('borderId', '0'))
+        if borders is not None and border_idx < len(borders):
+            sides = {side: el.get('style')
+                     for side in ('left', 'right', 'top', 'bottom')
+                     for el in [borders[border_idx].find(f"{{{ns}}}{side}")]
+                     if el is not None and el.get('style')}
+            if sides:
+                styles = set(sides.values())
+                out['border'] = (styles.pop()
+                                 if len(styles) == 1 and len(sides) == 4
+                                 else sides)
+
+    @staticmethod
+    def _decode_color(color_el):
+        """Decode a color element: rgb → hex string, theme → raw dict."""
+        if color_el is None:
+            return None
+        rgb = color_el.get('rgb')
+        if rgb is not None:
+            return rgb[2:] if len(rgb) == 8 and rgb.startswith('FF') else rgb
+        if color_el.get('theme') is not None:
+            out = {'theme': int(color_el.get('theme'))}
+            if color_el.get('tint') is not None:
+                out['tint'] = float(color_el.get('tint'))
+            return out
+        return None
 
     def _numfmt_id_for(self, num_fmts, format_code):
         """Return the numFmtId for ``format_code``, creating a numFmt if needed."""

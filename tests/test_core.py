@@ -1914,3 +1914,65 @@ class TestDateRoundTrip:
         pkg = XLSXPackage(make_date1904_xlsx(tmp_path))
         pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
         assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
+
+
+class TestStyleGetters:
+    def test_get_cell_style_returns_id(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(bold=True)
+        pkg.update_cell("Sheet1", "A1", value=1, style_id=sid)
+        assert pkg.get_cell_style("Sheet1", "A1") == sid
+
+    def test_get_cell_style_unstyled_and_missing(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=1)
+        assert pkg.get_cell_style("Sheet1", "A1") is None
+        assert pkg.get_cell_style("Sheet1", "Z9") is None
+
+    def test_get_cell_style_read_only_does_not_pollute(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.get_cell_style("Sheet1", "A1")
+        assert pkg.sheet_map["Sheet1"] not in pkg.trees
+
+    def test_get_style_decodes_composed_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(bold=True, font_size=12, font_name="Arial",
+                            font_color="#FF0000", fill_color="DDEBF7",
+                            border="thin", align="center", valign="top",
+                            wrap=True, number_format="$#,##0.00")
+        decoded = pkg.get_style(sid)
+        assert decoded == {
+            "number_format": "$#,##0.00", "bold": True, "italic": False,
+            "font_size": 12.0, "font_name": "Arial", "font_color": "FF0000",
+            "fill_color": "DDEBF7", "border": "thin", "align": "center",
+            "valign": "top", "wrap": True,
+        }
+
+    def test_get_style_round_trips_through_add_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(italic=True, fill_color="EEEEEE", align="right")
+        clone = pkg.add_style(**pkg.get_style(sid))
+        assert pkg.get_style(clone) == pkg.get_style(sid)
+
+    def test_get_style_plain_base_style(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        decoded = pkg.get_style(0)  # fixture's base xf
+        assert decoded["number_format"] is None
+        assert decoded["bold"] is False
+        assert decoded["fill_color"] is None
+
+    def test_get_style_builtin_numfmt_decoded(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_number_format("0.00")  # loads styles into trees
+        cell_xfs = pkg.trees["xl/styles.xml"].getroot().find(f"{{{NS}}}cellXfs")
+        xf = ET.SubElement(cell_xfs, f"{{{NS}}}xf")
+        for attr, val in (("numFmtId", "9"), ("fontId", "0"), ("fillId", "0"),
+                          ("borderId", "0"), ("xfId", "0")):
+            xf.set(attr, val)
+        cell_xfs.set("count", str(len(cell_xfs)))
+        assert pkg.get_style(len(cell_xfs) - 1)["number_format"] == "0%"
+
+    def test_get_style_raises_without_styles_part(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            pkg.get_style(0)
