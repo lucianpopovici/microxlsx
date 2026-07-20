@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Inspection helpers: `sheet_names()`, `table_names()`, and
+  `table_dimensions(table_name)` (rows × cols, header included).
+- `clear_cell(sheet_name, cell_ref)` — remove a cell (the row is kept) and flag
+  a recalc.
+- `append_table_row(table_name, values)` — append a data row (dict by column
+  name or positional list), growing the table and shoving any table directly
+  below it out of the way (minimal, cascading), just like `resize_table`.
+- `set_column_width(sheet_name, column, width)` and
+  `set_row_height(sheet_name, row, height)`.
 - `XLSXPackage.add_number_format(format_code)` — register a custom number
   format in `xl/styles.xml` and get back a reusable `style_id` (deduped by
   code). Enables currency / percentage / date formatting from scratch.
