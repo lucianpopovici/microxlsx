@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `XLSXPackage.add_number_format(format_code)` — register a custom number
+  format in `xl/styles.xml` and get back a reusable `style_id` (deduped by
+  code). Enables currency / percentage / date formatting from scratch.
+- Date support: `update_cell(value=datetime.date | datetime.datetime)` writes
+  the value as an Excel serial number and, unless a `style_id` is given,
+  auto-applies a default date/datetime number format.
 - `XLSXPackage.get_cell(sheet_name, cell_ref)` and
   `get_table_cell(table_name, row_offset, col_name)` — read a cell's value,
   resolving shared strings (including rich-text runs), inline strings, booleans,
@@ -44,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `xl/calcChain.xml` is dropped and its `[Content_Types].xml` override and
   workbook relationship are removed, so Excel rebuilds it cleanly instead of
   warning about recovered content.
+- Editing a cell value now also flags the workbook for recalculation
+  (`fullCalcOnLoad`), so a formula that reads the changed cell doesn't keep a
+  stale cached result. The calc chain is kept for value edits (its structure is
+  unchanged).
 
 ### Fixed
 
