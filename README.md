@@ -30,11 +30,25 @@ Features
 from microxlsx import XLSXPackage
 
 pkg = XLSXPackage("template.xlsm")
+
+# Read existing values (resolves shared strings, typed cells, cached formulas)
+current = pkg.get_cell("Sheet1", "B2")
+qty = pkg.get_table_cell("SalesTable", 1, "Amount")
+
+# Write values, formulas, booleans, merges
 pkg.update_table_cell("SalesTable", 1, "Amount", 500.25)
 pkg.update_cell("Sheet1", "D10", formula="SUM(B1:B9)")
+pkg.update_cell("Sheet1", "E10", value=True)
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
+
+`get_cell` / `get_table_cell` return `str` / `int` / `float` / `bool` (or a
+formula cell's cached result), or `None` for an empty cell. Reading a sheet you
+haven't modified doesn't disturb it — it's still streamed through untouched on
+save. Editing a formula invalidates the workbook's cached calculation chain
+(`xl/calcChain.xml` is dropped and its references cleaned up) so Excel rebuilds
+it cleanly on open instead of warning about recovered content.
 
 ** 📐 Resizing tables with minimal movement
 

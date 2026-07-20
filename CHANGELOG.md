@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `XLSXPackage.get_cell(sheet_name, cell_ref)` and
+  `get_table_cell(table_name, row_offset, col_name)` — read a cell's value,
+  resolving shared strings (including rich-text runs), inline strings, booleans,
+  numbers, error values, and a formula cell's cached result. Reading a sheet
+  that hasn't been modified leaves it streamed through untouched on save.
 - `XLSXPackage.resize_table(table_name, *, add_rows=0, add_cols=0)` — grow or
   shrink a table along the row and/or column axis.
   - **Minimal, cascading shove:** growing shoves only the tables that actually
@@ -35,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - After a move rewrites formulas, the workbook is flagged
     `calcPr fullCalcOnLoad="1"` so Excel recomputes on open and no stale cached
     `<v>` result is trusted.
+- Editing or moving a formula now invalidates the cached calculation chain:
+  `xl/calcChain.xml` is dropped and its `[Content_Types].xml` override and
+  workbook relationship are removed, so Excel rebuilds it cleanly instead of
+  warning about recovered content.
+
+### Fixed
+
+- `update_cell(value=True/False)` now writes a proper boolean cell (`t="b"`
+  with `1`/`0`) instead of an invalid bare `<v>True</v>`.
 
 ### Notes
 
