@@ -1,6 +1,7 @@
 """
 Unit tests for microxlsx.core
 """
+import datetime
 import zipfile
 import pytest
 
@@ -448,6 +449,35 @@ def make_calcchain_xlsx(tmp_path):
         zf.writestr("xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2"))
         zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
         zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
+def make_styles_xlsx(tmp_path):
+    """XLSX with a minimal but valid styles part (one base cellXfs entry)."""
+    path = str(tmp_path / "styles.xlsx")
+    styles = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<styleSheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b'<fonts count="1"><font><sz val="11"/></font></fonts>'
+        b'<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        b'<borders count="1"><border/></borders>'
+        b'<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0"'
+        b' borderId="0"/></cellStyleXfs>'
+        b'<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0"'
+        b' borderId="0" xfId="0"/></cellXfs>'
+        b"</styleSheet>"
+    )
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"><sheetData/></worksheet>'
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", WORKBOOK_XML)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/styles.xml", styles)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
     return path
 
 
@@ -1254,3 +1284,121 @@ class TestCalcChainInvalidation:
         with self._saved(pkg, tmp_path) as zf:
             assert "xl/calcChain.xml" in zf.namelist()
             assert b"calcChain" in zf.read("[Content_Types].xml")
+
+
+class TestNumberFormats:
+    def _styles(self, pkg):
+        return pkg.trees["xl/styles.xml"].getroot()
+
+    def test_returns_style_id(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        assert pkg.add_number_format("#,##0.00") == 1  # base xf is 0
+
+    def test_creates_numfmt_and_xf(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_number_format("#,##0.00")
+        root = self._styles(pkg)
+        num_fmts = root.find(f"{{{NS}}}numFmts")
+        assert num_fmts.get("count") == "1"
+        entry = num_fmts.find(f"{{{NS}}}numFmt")
+        assert entry.get("numFmtId") == "164"
+        assert entry.get("formatCode") == "#,##0.00"
+        cell_xfs = root.find(f"{{{NS}}}cellXfs")
+        assert cell_xfs.get("count") == "2"
+        assert cell_xfs.findall(f"{{{NS}}}xf")[1].get("numFmtId") == "164"
+
+    def test_numfmts_is_first_child(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_number_format("0%")
+        tags = [c.tag.split("}")[-1] for c in self._styles(pkg)]
+        assert tags[0] == "numFmts"
+
+    def test_dedup_same_code(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        first = pkg.add_number_format("#,##0.00")
+        second = pkg.add_number_format("#,##0.00")
+        assert first == second
+        assert self._styles(pkg).find(f"{{{NS}}}cellXfs").get("count") == "2"
+
+    def test_distinct_codes_get_distinct_ids(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        a = pkg.add_number_format("#,##0.00")
+        b = pkg.add_number_format("0%")
+        assert a != b
+        ids = [e.get("numFmtId")
+               for e in self._styles(pkg).find(f"{{{NS}}}numFmts")]
+        assert ids == ["164", "165"]
+
+    def test_style_applies_to_cell(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        fmt = pkg.add_number_format("#,##0.00")
+        pkg.update_cell("Sheet1", "A1", value=1234.5, style_id=fmt)
+        cell = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f".//{{{NS}}}c[@r='A1']")
+        assert cell.get("s") == str(fmt)
+
+    def test_raises_without_styles_part(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))  # no styles.xml
+        with pytest.raises(FileNotFoundError):
+            pkg.add_number_format("0.00")
+
+
+class TestDateValues:
+    def _cell(self, pkg, ref):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f".//{{{NS}}}c[@r='{ref}']")
+
+    def test_date_serial(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        assert pkg.get_cell("Sheet1", "A1") == 45306  # Excel serial
+
+    def test_datetime_serial_has_time_fraction(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.datetime(2024, 1, 15, 6))
+        assert pkg.get_cell("Sheet1", "A1") == 45306.25  # 6h = 0.25 day
+
+    def test_date_cell_is_numeric_not_text(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        assert self._cell(pkg, "A1").get("t") is None
+
+    def test_date_auto_applies_date_format(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        style_id = int(self._cell(pkg, "A1").get("s"))
+        xf = pkg.trees["xl/styles.xml"].getroot().find(f"{{{NS}}}cellXfs")[style_id]
+        num_fmt_id = xf.get("numFmtId")
+        codes = {e.get("numFmtId"): e.get("formatCode")
+                 for e in pkg.trees["xl/styles.xml"].getroot().find(f"{{{NS}}}numFmts")}
+        assert "yyyy-mm-dd" in codes[num_fmt_id]
+
+    def test_explicit_style_overrides_auto_date_format(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        custom = pkg.add_number_format("dd/mm/yy")
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15), style_id=custom)
+        assert self._cell(pkg, "A1").get("s") == str(custom)
+
+    def test_date_without_styles_part_still_writes_serial(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))  # no styles.xml
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        assert pkg.get_cell("Sheet1", "A1") == 45306
+        assert self._cell(pkg, "A1").get("s") is None  # unformatted
+
+
+class TestRecalcOnValueEdit:
+    def _calc_pr(self, pkg):
+        return pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}calcPr")
+
+    def test_value_edit_sets_full_calc_on_load(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "D1", value=99)
+        assert self._calc_pr(pkg).get("fullCalcOnLoad") == "1"
+
+    def test_value_edit_keeps_calc_chain(self, tmp_path):
+        # Changing an input value keeps calcChain (structure unchanged).
+        pkg = XLSXPackage(make_calcchain_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "B5", value=10)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            assert "xl/calcChain.xml" in zf.namelist()
+            assert zf.read("xl/workbook.xml").decode().count("fullCalcOnLoad") == 1

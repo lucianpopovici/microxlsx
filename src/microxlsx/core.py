@@ -4,8 +4,12 @@ Core functionality for MicroXLSX.
 import re
 import zipfile
 import io
+import datetime
 import xml.etree.ElementTree as ET
 from .utils import cell_to_indices, indices_to_cell
+
+# Excel's day-zero (accounts for the fictional 1900 leap day for later dates).
+_EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
 
 # A1-style reference: optional 'Sheet'! qualifier, optional $ absolute markers.
 _CELL_REF_RE = re.compile(
@@ -31,6 +35,8 @@ class XLSXPackage:
         'cp': 'http://schemas.openxmlformats.org/package/2006/metadata/core-properties',
         'dc': 'http://purl.org/dc/elements/1.1/'
     }
+    # Custom number-format ids must start at 164 (0-163 are reserved built-ins).
+    CUSTOM_FMT_BASE = 164
 
     def __init__(self, filename):
         self.filename = filename
@@ -39,6 +45,7 @@ class XLSXPackage:
         self.table_map = {}
         self._shared_strings = None
         self._drop_calc_chain = False
+        self._added_formats = {}
         for prefix, uri in self.NS.items():
             ET.register_namespace(prefix if prefix != 'main' else '', uri)
         self._build_maps()
@@ -111,6 +118,11 @@ class XLSXPackage:
     # pylint: disable=too-many-arguments
     def update_cell(self, sheet_name, cell_ref, *, value=None, formula=None, style_id=None):
         """Updates or creates a cell with values/formulas."""
+        if style_id is None and isinstance(value, datetime.date):
+            try:
+                style_id = self._default_date_style(value)
+            except FileNotFoundError:
+                pass  # no styles part: still write the serial, just unformatted
         path = self.sheet_map.get(sheet_name, sheet_name)
         with zipfile.ZipFile(self.filename, 'r') as zin:
             tree = self._get_tree(zin, path)
@@ -141,18 +153,14 @@ class XLSXPackage:
         """Helper to set cell value."""
         if isinstance(value, bool):
             cell.set('t', 'b')
-            is_node = cell.find(f"{{{self.NS['main']}}}is")
-            if is_node is not None:
-                cell.remove(is_node)
-            v_node = cell.find(f"{{{self.NS['main']}}}v")
-            if v_node is None:
-                v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
-            v_node.text = '1' if value else '0'
+            self._remove_inline_string(cell)
+            self._cell_v(cell).text = '1' if value else '0'
+        elif isinstance(value, datetime.date):
+            cell.attrib.pop('t', None)
+            self._remove_inline_string(cell)
+            self._cell_v(cell).text = str(self._to_excel_serial(value))
         elif isinstance(value, (int, float)):
-            v_node = cell.find(f"{{{self.NS['main']}}}v")
-            if v_node is None:
-                v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
-            v_node.text = str(value)
+            self._cell_v(cell).text = str(value)
             cell.attrib.pop('t', None)
         else:
             cell.set('t', 'inlineStr')
@@ -163,6 +171,91 @@ class XLSXPackage:
             if t_node is None:
                 t_node = ET.SubElement(is_node, f"{{{self.NS['main']}}}t")
             t_node.text = str(value)
+        # A changed input value leaves dependent formula caches stale.
+        self._set_full_calc_on_load()
+
+    def _cell_v(self, cell):
+        """Return the cell's ``<v>`` child, creating it if absent."""
+        v_node = cell.find(f"{{{self.NS['main']}}}v")
+        if v_node is None:
+            v_node = ET.SubElement(cell, f"{{{self.NS['main']}}}v")
+        return v_node
+
+    def _remove_inline_string(self, cell):
+        """Drop an ``<is>`` payload left over from a prior string write."""
+        is_node = cell.find(f"{{{self.NS['main']}}}is")
+        if is_node is not None:
+            cell.remove(is_node)
+
+    @staticmethod
+    def _to_excel_serial(value):
+        """Convert a date/datetime to an Excel serial number."""
+        if isinstance(value, datetime.datetime):
+            delta = value - _EXCEL_EPOCH
+            return delta.days + (delta.seconds + delta.microseconds / 1e6) / 86400
+        return (value - _EXCEL_EPOCH.date()).days
+
+    def add_number_format(self, format_code):
+        """Register a custom number format, returning a ``style_id`` for it.
+
+        The id indexes ``cellXfs`` and can be passed as ``style_id`` to
+        ``update_cell`` / ``update_table_cell``. Repeated calls with the same
+        code reuse the same style. Requires an existing ``xl/styles.xml``.
+        """
+        if format_code in self._added_formats:
+            return self._added_formats[format_code]
+        ns = self.NS['main']
+        root = self._styles_tree().getroot()
+        num_fmts = root.find(f"{{{ns}}}numFmts")
+        if num_fmts is None:
+            num_fmts = ET.Element(f"{{{ns}}}numFmts")
+            root.insert(0, num_fmts)  # numFmts is the first child of styleSheet
+        fmt_id = self._numfmt_id_for(num_fmts, format_code)
+        cell_xfs = root.find(f"{{{ns}}}cellXfs")
+        if cell_xfs is None:
+            raise ValueError("xl/styles.xml has no cellXfs; cannot register a style")
+        xf_node = ET.SubElement(cell_xfs, f"{{{ns}}}xf")
+        xf_node.set('numFmtId', str(fmt_id))
+        for attr in ('fontId', 'fillId', 'borderId', 'xfId'):
+            xf_node.set(attr, '0')
+        xf_node.set('applyNumberFormat', '1')
+        cell_xfs.set('count', str(len(cell_xfs)))
+        style_id = len(cell_xfs) - 1
+        self._added_formats[format_code] = style_id
+        return style_id
+
+    def _numfmt_id_for(self, num_fmts, format_code):
+        """Return the numFmtId for ``format_code``, creating a numFmt if needed."""
+        ns = self.NS['main']
+        entries = num_fmts.findall(f"{{{ns}}}numFmt")
+        for entry in entries:
+            if entry.get('formatCode') == format_code:
+                return int(entry.get('numFmtId'))
+        fmt_id = max([int(e.get('numFmtId')) for e in entries]
+                     + [self.CUSTOM_FMT_BASE - 1]) + 1
+        entry = ET.SubElement(num_fmts, f"{{{ns}}}numFmt")
+        entry.set('numFmtId', str(fmt_id))
+        entry.set('formatCode', format_code)
+        num_fmts.set('count', str(len(entries) + 1))
+        return fmt_id
+
+    def _default_date_style(self, value):
+        """Style id for a default date/datetime number format."""
+        code = ('yyyy-mm-dd hh:mm:ss' if isinstance(value, datetime.datetime)
+                else 'yyyy-mm-dd')
+        return self.add_number_format(code)
+
+    def _styles_tree(self):
+        """Return the parsed ``xl/styles.xml`` tree, raising if it is absent."""
+        if 'xl/styles.xml' not in self.trees:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                try:
+                    self._get_tree(zin, 'xl/styles.xml')
+                except KeyError:
+                    raise FileNotFoundError(
+                        "xl/styles.xml not found; a styles part is required"
+                    ) from None
+        return self.trees['xl/styles.xml']
 
     # pylint: disable=too-many-arguments
     def update_table_cell(self, table_name, row_offset, col_name, value, *, style_id=None):

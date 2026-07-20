@@ -27,6 +27,7 @@ Features
 ** 🚀 Usage Example
 
 ```python
+import datetime
 from microxlsx import XLSXPackage
 
 pkg = XLSXPackage("template.xlsm")
@@ -35,10 +36,16 @@ pkg = XLSXPackage("template.xlsm")
 current = pkg.get_cell("Sheet1", "B2")
 qty = pkg.get_table_cell("SalesTable", 1, "Amount")
 
-# Write values, formulas, booleans, merges
+# Write values, formulas, booleans, dates, merges
 pkg.update_table_cell("SalesTable", 1, "Amount", 500.25)
 pkg.update_cell("Sheet1", "D10", formula="SUM(B1:B9)")
 pkg.update_cell("Sheet1", "E10", value=True)
+pkg.update_cell("Sheet1", "F10", value=datetime.date(2026, 1, 31))  # auto date format
+
+# Add a number format and reuse its style id
+money = pkg.add_number_format("$#,##0.00")
+pkg.update_cell("Sheet1", "G10", value=1999.9, style_id=money)
+
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
@@ -46,9 +53,13 @@ pkg.save("output.xlsm")
 `get_cell` / `get_table_cell` return `str` / `int` / `float` / `bool` (or a
 formula cell's cached result), or `None` for an empty cell. Reading a sheet you
 haven't modified doesn't disturb it — it's still streamed through untouched on
-save. Editing a formula invalidates the workbook's cached calculation chain
-(`xl/calcChain.xml` is dropped and its references cleaned up) so Excel rebuilds
-it cleanly on open instead of warning about recovered content.
+save. `datetime.date` / `datetime.datetime` values are written as Excel serial
+numbers and auto-formatted (pass an explicit `style_id` to override).
+`add_number_format` registers a custom format in `xl/styles.xml` and returns a
+reusable `style_id`. Editing a formula (or a value a formula depends on)
+invalidates the cached results — the workbook is flagged for recalculation, and
+a formula edit additionally drops the stale `xl/calcChain.xml` and its
+references — so Excel opens cleanly instead of warning about recovered content.
 
 ** 📐 Resizing tables with minimal movement
 
