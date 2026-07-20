@@ -158,6 +158,145 @@ class XLSXPackage:
             table['sheet'], indices_to_cell(abs_row, abs_col), value=value, style_id=style_id
         )
 
+    def resize_table(self, table_name, *, add_rows=0):
+        """Grow or shrink a table by ``add_rows`` rows along the row axis.
+
+        Growing shoves any tables that would collide below the target down by
+        the *minimal* amount needed to clear it (cascading through further
+        tables). Shrinking (negative ``add_rows``) only narrows the range and
+        never moves other tables. Column-axis resizing and formula/merge-range
+        rewriting are intentionally out of scope for now.
+        """
+        if add_rows == 0:
+            return
+        table = self.table_map[table_name]
+        r1, _ = table['start_indices']
+        end_r, end_c = cell_to_indices(table['range'][1])
+        new_end_r = end_r + add_rows
+        if new_end_r < r1:
+            raise ValueError(
+                f"resize_table: add_rows={add_rows} would shrink "
+                f"'{table_name}' above its header row"
+            )
+        # Update the target table's own range + ref (header/start is unchanged).
+        table['range'][1] = indices_to_cell(new_end_r, end_c)
+        t_root = self.trees[table['xml_path']].getroot()
+        t_root.set('ref', f"{table['range'][0]}:{table['range'][1]}")
+
+        if add_rows > 0:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                self._get_tree(zin, self.sheet_map[table['sheet']])
+                self._resolve_collisions_down(table_name, table)
+
+    @staticmethod
+    def _table_box(table):
+        """Return (top, left, bottom, right) 0-based indices of a table."""
+        top, left = table['start_indices']
+        bottom, right = cell_to_indices(table['range'][1])
+        return top, left, bottom, right
+
+    # pylint: disable=too-many-locals
+    def _resolve_collisions_down(self, target_name, target):
+        """Compute minimal downward shifts for tables the target now overlaps."""
+        tables = {
+            name: t for name, t in self.table_map.items()
+            if t['sheet'] == target['sheet']
+        }
+        orig_top = {name: self._table_box(t)[0] for name, t in tables.items()}
+        shift = {name: 0 for name in tables}
+
+        # Relaxation: repeatedly push a lower table down until nothing overlaps.
+        # Starting from a valid (non-overlapping) layout, only the target's new
+        # bottom edge can trigger shifts, so movement stays minimal.
+        changed = True
+        while changed:
+            changed = False
+            for a_name, a_tbl in tables.items():
+                _, a_left, a_bottom0, a_right = self._table_box(a_tbl)
+                a_bottom = a_bottom0 + shift[a_name]
+                for b_name, b_tbl in tables.items():
+                    if b_name in (a_name, target_name):
+                        continue  # never move the target itself
+                    if orig_top[a_name] >= orig_top[b_name]:
+                        continue  # only push tables that started below A
+                    b_top0, b_left, _, b_right = self._table_box(b_tbl)
+                    if a_right < b_left or b_right < a_left:
+                        continue  # no horizontal overlap
+                    needed = (a_bottom + 1) - (b_top0 + shift[b_name])
+                    if needed > 0:
+                        shift[b_name] += needed
+                        changed = True
+
+        # Apply moves lowest-first so each destination band is already clear.
+        movers = [n for n in tables if n != target_name and shift[n] > 0]
+        movers.sort(key=lambda n: orig_top[n], reverse=True)
+        for name in movers:
+            self._move_table_down(tables[name], shift[name])
+
+    # pylint: disable=too-many-locals
+    def _move_table_down(self, table, delta):
+        """Relocate a table's cell block down by ``delta`` rows and update refs."""
+        if delta <= 0:
+            return
+        ns = self.NS['main']
+        sheet_data = self.trees[self.sheet_map[table['sheet']]].getroot().find(
+            f".//{{{ns}}}sheetData"
+        )
+        top, left, bottom, right = self._table_box(table)
+        # Bottom-to-top so a cell is never overwritten before it is moved.
+        for row_idx in range(bottom, top - 1, -1):
+            row = sheet_data.find(f"{{{ns}}}row[@r='{row_idx + 1}']")
+            if row is None:
+                continue
+            for col in range(left, right + 1):
+                old_ref = indices_to_cell(row_idx, col)
+                cell = row.find(f"{{{ns}}}c[@r='{old_ref}']")
+                if cell is None:
+                    continue
+                row.remove(cell)
+                new_ref = indices_to_cell(row_idx + delta, col)
+                cell.set('r', new_ref)
+                dest_row = self._row_get_or_create(sheet_data, row_idx + delta + 1)
+                existing = dest_row.find(f"{{{ns}}}c[@r='{new_ref}']")
+                if existing is not None:
+                    dest_row.remove(existing)
+                self._cell_insert_sorted(dest_row, cell)
+
+        table['start_indices'] = (top + delta, left)
+        table['range'] = [
+            indices_to_cell(top + delta, left),
+            indices_to_cell(bottom + delta, right),
+        ]
+        t_root = self.trees[table['xml_path']].getroot()
+        t_root.set('ref', f"{table['range'][0]}:{table['range'][1]}")
+
+    def _row_get_or_create(self, sheet_data, row_num):
+        """Return the row element for ``row_num``, inserting it in sorted order."""
+        ns = self.NS['main']
+        existing = sheet_data.find(f"{{{ns}}}row[@r='{row_num}']")
+        if existing is not None:
+            return existing
+        new_row = ET.Element(f"{{{ns}}}row")
+        new_row.set('r', str(row_num))
+        idx = len(sheet_data)
+        for i, row in enumerate(sheet_data):
+            if int(row.get('r')) > row_num:
+                idx = i
+                break
+        sheet_data.insert(idx, new_row)
+        return new_row
+
+    @staticmethod
+    def _cell_insert_sorted(row, cell):
+        """Insert ``cell`` into ``row`` keeping cells ordered by column index."""
+        col = cell_to_indices(cell.get('r'))[1]
+        idx = len(row)
+        for i, existing in enumerate(row):
+            if cell_to_indices(existing.get('r'))[1] > col:
+                idx = i
+                break
+        row.insert(idx, cell)
+
     def save(self, output_path):
         """Preservation Loop."""
         with zipfile.ZipFile(self.filename, 'r') as zin:
