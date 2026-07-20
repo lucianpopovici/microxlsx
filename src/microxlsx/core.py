@@ -13,6 +13,14 @@ _CELL_REF_RE = re.compile(
     r"(?P<c_abs>\$?)(?P<col>[A-Za-z]{1,3})(?P<r_abs>\$?)(?P<row>[0-9]+)"
 )
 
+# A cell or range carrying a single leading sheet qualifier, used for defined
+# names where a cross-sheet range must be treated as one unit.
+_ENDPOINT = r"\$?[A-Za-z]{1,3}\$?[0-9]+"
+_RANGE_RE = re.compile(
+    r"(?P<sheet>(?:'[^']+'|[A-Za-z0-9_.]+)!)?"
+    r"(?P<a>" + _ENDPOINT + r")(?::(?P<b>" + _ENDPOINT + r"))?"
+)
+
 class XLSXPackage:
     """
     Represents an Excel (XLSX) package.
@@ -341,6 +349,7 @@ class XLSXPackage:
         self._rewrite_formulas(sheet_data, table['sheet'], box, delta=delta, axis=axis)
         self._shift_merged_cells(root, box, delta, axis)
         self._rewrite_range_features(root, table['sheet'], box, delta=delta, axis=axis)
+        self._rewrite_defined_names(table['sheet'], box, delta=delta, axis=axis)
 
         new_top = top + (delta if axis == 0 else 0)
         new_left = left + (delta if axis == 1 else 0)
@@ -437,6 +446,60 @@ class XLSXPackage:
             for part in sqref.split()
         ]
         elem.set('sqref', ' '.join(parts))
+
+    def _rewrite_defined_names(self, sheet_name, box, *, delta, axis):
+        """Shift workbook defined names whose ranges point into the moved block."""
+        ns = self.NS['main']
+        workbook = self.trees.get('xl/workbook.xml')
+        if workbook is None:
+            return
+        names = workbook.getroot().find(f"{{{ns}}}definedNames")
+        if names is None:
+            return
+        for name in names.findall(f"{{{ns}}}definedName"):
+            if name.text:
+                name.text = self._shift_name_refs(
+                    name.text, sheet_name, box, delta=delta, axis=axis
+                )
+
+    def _shift_name_refs(self, text, sheet_name, box, *, delta, axis):
+        """Shift each sheet-qualified range in a defined-name expression."""
+
+        def repl(match):
+            start = match.start()
+            if start > 0 and (text[start - 1].isalnum() or text[start - 1] == '_'):
+                return match.group(0)  # part of a longer name
+            sheet = match.group('sheet')
+            if sheet and sheet[:-1].strip("'") != sheet_name:
+                return match.group(0)  # a different sheet
+            end_a, end_b = match.group('a'), match.group('b')
+            if end_b is None:
+                if match.end() < len(text) and text[match.end()] == '(':
+                    return match.group(0)  # a function call
+                shifted = self._shift_endpoint(end_a, box, delta, axis)
+                return match.group(0) if shifted is None else f"{sheet or ''}{shifted}"
+            new_a = self._shift_endpoint(end_a, box, delta, axis)
+            new_b = self._shift_endpoint(end_b, box, delta, axis)
+            if new_a is None or new_b is None:
+                return match.group(0)  # not fully contained
+            return f"{sheet or ''}{new_a}:{new_b}"
+
+        return _RANGE_RE.sub(repl, text)
+
+    @staticmethod
+    def _shift_endpoint(endpoint, box, delta, axis):
+        """Shift a single ``$A$5``-style endpoint if inside ``box``, else None."""
+        top, left, bottom, right = box
+        match = re.match(r"(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)", endpoint)
+        c_abs, col_str, r_abs, row_str = match.groups()
+        row, col = cell_to_indices(col_str + row_str)
+        if not (top <= row <= bottom and left <= col <= right):
+            return None
+        if axis == 0:
+            row += delta
+        else:
+            col += delta
+        return f"{c_abs}{indices_to_cell(0, col)[:-1]}{r_abs}{row + 1}"
 
     @staticmethod
     def _shift_range_ref(ref, box, delta, axis):
