@@ -3,6 +3,7 @@ Unit tests for microxlsx.core
 """
 import datetime
 import zipfile
+import xml.etree.ElementTree as ET
 import pytest
 
 from microxlsx.core import XLSXPackage
@@ -478,6 +479,64 @@ def make_styles_xlsx(tmp_path):
         zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
         zf.writestr("xl/styles.xml", styles)
         zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return path
+
+
+def make_opc_xlsx(tmp_path):
+    """A conformant package (content-types + rels) with one sheet and one table."""
+    path = str(tmp_path / "opc.xlsx")
+    content_types = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-'
+        b'package.relationships+xml"/>'
+        b'<Default Extension="xml" ContentType="application/xml"/>'
+        b'<Override PartName="/xl/workbook.xml" ContentType="application/'
+        b'vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        b'<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/'
+        b'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        b'<Override PartName="/xl/tables/table1.xml" ContentType="application/'
+        b'vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>'
+        b"</Types>"
+    )
+    workbook = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships">'
+        b'<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    wb_rels = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/'
+        b'package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        b"</Relationships>"
+    )
+    sheet = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships"><sheetData/>'
+        b'<tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>'
+    )
+    sheet_rels = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/'
+        b'package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+        b'officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>'
+        b"</Relationships>"
+    )
+    table = _table_xml(b"T1", b"A1:B2")
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("xl/workbook.xml", workbook)
+        zf.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+        zf.writestr("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels)
+        zf.writestr("xl/tables/table1.xml", table)
     return path
 
 
@@ -1512,3 +1571,156 @@ class TestColumnRowSizing:
         pkg.set_row_height("Sheet1", 1, 42)
         rows = self._root(pkg).findall(f".//{{{NS}}}row[@r='1']")
         assert len(rows) == 1 and rows[0].get("ht") == "42"
+
+
+NS_CT = "http://schemas.openxmlformats.org/package/2006/content-types"
+NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _reopen(tmp_path, pkg, name="out.xlsx"):
+    out = str(tmp_path / name)
+    pkg.save(out)
+    return out, XLSXPackage(out)
+
+
+def _read(out, part):
+    with zipfile.ZipFile(out, "r") as zf:
+        return zf.read(part)
+
+
+def _names(out):
+    with zipfile.ZipFile(out, "r") as zf:
+        return set(zf.namelist())
+
+
+class TestAddSheet:
+    def test_appears_in_sheet_names(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        _, reopened = _reopen(tmp_path, pkg)
+        assert reopened.sheet_names() == ["Sheet1", "Data"]
+
+    def test_new_part_and_content_type(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        out, _ = _reopen(tmp_path, pkg)
+        assert "xl/worksheets/sheet2.xml" in _names(out)
+        assert b"/xl/worksheets/sheet2.xml" in _read(out, "[Content_Types].xml")
+
+    def test_workbook_relationship_added(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        out, _ = _reopen(tmp_path, pkg)
+        rels = _read(out, "xl/_rels/workbook.xml.rels")
+        assert b"worksheets/sheet2.xml" in rels
+
+    def test_duplicate_name_raises(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.add_sheet("Sheet1")
+
+    def test_can_write_to_new_sheet(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        pkg.update_cell("Data", "A1", value="hello")
+        _, reopened = _reopen(tmp_path, pkg)
+        assert reopened.get_cell("Data", "A1") == "hello"
+
+
+class TestRemoveSheet:
+    def test_removed_from_names(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        _, reopened = _reopen(tmp_path, pkg)
+        reopened.remove_sheet("Data")
+        _, again = _reopen(tmp_path, reopened, "again.xlsx")
+        assert again.sheet_names() == ["Sheet1"]
+
+    def test_parts_and_content_type_dropped(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        _, mid = _reopen(tmp_path, pkg)
+        mid.remove_sheet("Data")
+        out, _ = _reopen(tmp_path, mid, "final.xlsx")
+        assert "xl/worksheets/sheet2.xml" not in _names(out)
+        assert b"/xl/worksheets/sheet2.xml" not in _read(out, "[Content_Types].xml")
+
+    def test_last_sheet_guard(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.remove_sheet("Sheet1")
+
+    def test_removing_sheet_drops_its_tables(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        pkg.add_table("Data", "T2", "A1:B3", ["a", "b"])
+        out, _ = _reopen(tmp_path, pkg)
+        pkg2 = XLSXPackage(out)
+        pkg2.remove_sheet("Data")
+        out2, reopened = _reopen(tmp_path, pkg2, "f.xlsx")
+        assert "T2" not in reopened.table_names()
+        assert "xl/tables/table2.xml" not in _names(out2)
+
+
+class TestAddTable:
+    def test_appears_in_table_names(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        pkg.add_table("Data", "T2", "A1:C4", ["x", "y", "z"])
+        _, reopened = _reopen(tmp_path, pkg)
+        assert "T2" in reopened.table_names()
+        assert reopened.table_dimensions("T2") == (4, 3)
+
+    def test_part_rels_and_content_type(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_sheet("Data")
+        pkg.add_table("Data", "T2", "A1:C4", ["x", "y", "z"])
+        out, _ = _reopen(tmp_path, pkg)
+        assert "xl/tables/table2.xml" in _names(out)
+        assert "xl/worksheets/_rels/sheet2.xml.rels" in _names(out)
+        assert b"/xl/tables/table2.xml" in _read(out, "[Content_Types].xml")
+
+    def test_unique_table_id(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T2", "D1:E2", ["p", "q"])
+        out, _ = _reopen(tmp_path, pkg)
+        ids = set()
+        with zipfile.ZipFile(out) as zf:
+            for n in zf.namelist():
+                if n.startswith("xl/tables/"):
+                    ids.add(ET.fromstring(zf.read(n)).get("id"))
+        assert len(ids) == 2  # distinct ids for table1 and table2
+
+    def test_can_write_via_new_table(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T2", "D1:E2", ["p", "q"])
+        pkg.update_table_cell("T2", 1, "p", 7)
+        _, reopened = _reopen(tmp_path, pkg)
+        assert reopened.get_table_cell("T2", 1, "p") == 7
+
+    def test_duplicate_name_raises(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.add_table("Sheet1", "T1", "D1:E2", ["p", "q"])
+
+
+class TestRemoveTable:
+    def test_removed_from_names(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.remove_table("T1")
+        _, reopened = _reopen(tmp_path, pkg)
+        assert not reopened.table_names()
+
+    def test_part_content_type_and_tablepart_dropped(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.remove_table("T1")
+        out, _ = _reopen(tmp_path, pkg)
+        assert "xl/tables/table1.xml" not in _names(out)
+        assert b"/xl/tables/table1.xml" not in _read(out, "[Content_Types].xml")
+        assert b"tablePart" not in _read(out, "xl/worksheets/sheet1.xml")
+
+    def test_relationship_dropped(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.remove_table("T1")
+        out, _ = _reopen(tmp_path, pkg)
+        assert b"table1.xml" not in _read(out, "xl/worksheets/_rels/sheet1.xml.rels")

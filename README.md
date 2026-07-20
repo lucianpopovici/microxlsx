@@ -53,6 +53,12 @@ pkg.clear_cell("Sheet1", "H10")
 pkg.set_column_width("Sheet1", "B", 18)
 pkg.set_row_height("Sheet1", 1, 24)
 
+# Add / remove sheets and tables (relationships + content-types handled)
+pkg.add_sheet("Summary")
+pkg.add_table("Summary", "Totals", "A1:C10", ["Region", "Q1", "Q2"])
+pkg.remove_table("OldTable")
+pkg.remove_sheet("Scratch")
+
 pkg.merge_cells("Sheet1", "A1:C1")
 pkg.save("output.xlsm")
 ```
