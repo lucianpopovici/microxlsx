@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bulk range operations: `write_range(sheet, start_ref, rows)` writes a 2D
+  block in a single tree pass (`None` entries leave cells untouched),
+  `get_range(sheet, ref)` reads a rectangle as lists (missing cells → `None`),
+  and `iter_table_rows(table)` yields each data row as a
+  `{column_name: value}` dict.
+- `add_style(...)` — compose a full cell style (bold/italic, font size, name
+  and color, solid fill, uniform border, horizontal/vertical alignment, wrap,
+  optional number format) into a reusable `style_id`. Identical calls dedupe.
 - Structural operations: `add_sheet(name)`, `remove_sheet(name)` (removes its
   tables too; refuses to remove the last sheet), `add_table(sheet, name, ref,
   columns)`, and `remove_table(name)`. These maintain `[Content_Types].xml`
@@ -69,8 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale cached result. The calc chain is kept for value edits (its structure is
   unchanged).
 
+### Changed
+
+- `get_cell` / `get_range` now return `datetime.date` / `datetime.datetime`
+  for numeric cells whose style carries a date number format (built-in ids and
+  custom codes are both detected), so dates written with `update_cell` round-
+  trip instead of coming back as raw serial numbers.
+
 ### Fixed
 
+- Date serial conversion honours the Mac 1904 date system
+  (`workbookPr date1904="1"`) in both directions; previously such workbooks
+  would get 1900-based serials (~4 years off).
 - `update_cell(value=True/False)` now writes a proper boolean cell (`t="b"`
   with `1`/`0`) instead of an invalid bare `<v>True</v>`.
 

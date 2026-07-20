@@ -11,6 +11,14 @@ from .utils import cell_to_indices, indices_to_cell
 
 # Excel's day-zero (accounts for the fictional 1900 leap day for later dates).
 _EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
+# Mac-origin workbooks (workbookPr date1904="1") count days from 1904 instead.
+_EXCEL_EPOCH_1904 = datetime.datetime(1904, 1, 1)
+
+# Built-in number-format ids that render as dates/times (ECMA-376 §18.8.30).
+_BUILTIN_DATE_FMTS = frozenset(
+    list(range(14, 23)) + list(range(27, 37)) + list(range(45, 48))
+    + list(range(50, 59))
+)
 
 # A1-style reference: optional 'Sheet'! qualifier, optional $ absolute markers.
 _CELL_REF_RE = re.compile(
@@ -30,7 +38,7 @@ class XLSXPackage:
     """
     Represents an Excel (XLSX) package.
     """
-    # pylint: disable=too-many-instance-attributes
+    # pylint: disable=too-many-instance-attributes,too-many-public-methods
     NS = {
         'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
         'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
@@ -57,6 +65,8 @@ class XLSXPackage:
         self._shared_strings = None
         self._drop_calc_chain = False
         self._added_formats = {}
+        self._added_styles = {}
+        self._date_style_cache = None
         self._source_parts = set()
         self._dropped_parts = set()
         self._ct_add = {}
@@ -454,13 +464,29 @@ class XLSXPackage:
         if is_node is not None:
             cell.remove(is_node)
 
-    @staticmethod
-    def _to_excel_serial(value):
+    def _excel_epoch(self):
+        """Return the workbook's day-zero, honouring the 1904 date system."""
+        ns = self.NS['main']
+        props = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}workbookPr")
+        if props is not None and props.get('date1904') in ('1', 'true'):
+            return _EXCEL_EPOCH_1904
+        return _EXCEL_EPOCH
+
+    def _to_excel_serial(self, value):
         """Convert a date/datetime to an Excel serial number."""
+        epoch = self._excel_epoch()
         if isinstance(value, datetime.datetime):
-            delta = value - _EXCEL_EPOCH
+            delta = value - epoch
             return delta.days + (delta.seconds + delta.microseconds / 1e6) / 86400
-        return (value - _EXCEL_EPOCH.date()).days
+        return (value - epoch.date()).days
+
+    def _from_excel_serial(self, serial):
+        """Convert a serial back to ``date`` (whole days) or ``datetime``."""
+        epoch = self._excel_epoch()
+        if serial == int(serial):
+            return epoch.date() + datetime.timedelta(days=int(serial))
+        # Round to whole seconds so float noise doesn't yield 05:59:59.999999.
+        return epoch + datetime.timedelta(seconds=round(serial * 86400))
 
     def add_number_format(self, format_code):
         """Register a custom number format, returning a ``style_id`` for it.
@@ -489,7 +515,111 @@ class XLSXPackage:
         cell_xfs.set('count', str(len(cell_xfs)))
         style_id = len(cell_xfs) - 1
         self._added_formats[format_code] = style_id
+        self._date_style_cache = None
         return style_id
+
+    # pylint: disable=too-many-locals
+    def add_style(self, *, number_format=None, bold=False, italic=False,
+                  font_size=None, font_name=None, font_color=None,
+                  fill_color=None, border=None, align=None, valign=None,
+                  wrap=False):
+        """Register a composed cell style and return its ``style_id``.
+
+        Colors are hex ``"RRGGBB"`` (with or without ``#``). ``border`` is a
+        border style name (e.g. ``"thin"``) applied to all four edges.
+        ``align``/``valign`` are OOXML alignment keywords. Identical calls
+        reuse the same style. Requires an existing ``xl/styles.xml``.
+        """
+        key = (number_format, bold, italic, font_size, font_name, font_color,
+               fill_color, border, align, valign, wrap)
+        if key in self._added_styles:
+            return self._added_styles[key]
+        ns = self.NS['main']
+        root = self._styles_tree().getroot()
+        cell_xfs = root.find(f"{{{ns}}}cellXfs")
+        if cell_xfs is None:
+            raise ValueError("xl/styles.xml has no cellXfs; cannot register a style")
+        xf_node = ET.SubElement(cell_xfs, f"{{{ns}}}xf")
+        for attr in ('numFmtId', 'fontId', 'fillId', 'borderId', 'xfId'):
+            xf_node.set(attr, '0')
+        if number_format is not None:
+            num_fmts = root.find(f"{{{ns}}}numFmts")
+            if num_fmts is None:
+                num_fmts = ET.Element(f"{{{ns}}}numFmts")
+                root.insert(0, num_fmts)
+            xf_node.set('numFmtId', str(self._numfmt_id_for(num_fmts, number_format)))
+            xf_node.set('applyNumberFormat', '1')
+        if bold or italic or font_size or font_name or font_color:
+            xf_node.set('fontId', str(self._add_font(
+                bold=bold, italic=italic, size=font_size,
+                name=font_name, color=font_color)))
+            xf_node.set('applyFont', '1')
+        if fill_color is not None:
+            xf_node.set('fillId', str(self._add_fill(fill_color)))
+            xf_node.set('applyFill', '1')
+        if border is not None:
+            xf_node.set('borderId', str(self._add_border(border)))
+            xf_node.set('applyBorder', '1')
+        if align or valign or wrap:
+            alignment = ET.SubElement(xf_node, f"{{{ns}}}alignment")
+            if align:
+                alignment.set('horizontal', align)
+            if valign:
+                alignment.set('vertical', valign)
+            if wrap:
+                alignment.set('wrapText', '1')
+            xf_node.set('applyAlignment', '1')
+        cell_xfs.set('count', str(len(cell_xfs)))
+        style_id = len(cell_xfs) - 1
+        self._added_styles[key] = style_id
+        self._date_style_cache = None
+        return style_id
+
+    def _add_font(self, *, bold, italic, size, name, color):
+        """Append a ``<font>`` to the styles part; return its index."""
+        ns = self.NS['main']
+        fonts = self.trees['xl/styles.xml'].getroot().find(f"{{{ns}}}fonts")
+        font = ET.SubElement(fonts, f"{{{ns}}}font")
+        if bold:
+            ET.SubElement(font, f"{{{ns}}}b")
+        if italic:
+            ET.SubElement(font, f"{{{ns}}}i")
+        if size is not None:
+            ET.SubElement(font, f"{{{ns}}}sz").set('val', str(size))
+        if color is not None:
+            ET.SubElement(font, f"{{{ns}}}color").set('rgb', self._argb(color))
+        if name is not None:
+            ET.SubElement(font, f"{{{ns}}}name").set('val', name)
+        fonts.set('count', str(len(fonts)))
+        return len(fonts) - 1
+
+    def _add_fill(self, color):
+        """Append a solid ``<fill>`` to the styles part; return its index."""
+        ns = self.NS['main']
+        fills = self.trees['xl/styles.xml'].getroot().find(f"{{{ns}}}fills")
+        fill = ET.SubElement(fills, f"{{{ns}}}fill")
+        pattern = ET.SubElement(fill, f"{{{ns}}}patternFill")
+        pattern.set('patternType', 'solid')
+        ET.SubElement(pattern, f"{{{ns}}}fgColor").set('rgb', self._argb(color))
+        fills.set('count', str(len(fills)))
+        return len(fills) - 1
+
+    def _add_border(self, style):
+        """Append a uniform ``<border>`` to the styles part; return its index."""
+        ns = self.NS['main']
+        borders = self.trees['xl/styles.xml'].getroot().find(f"{{{ns}}}borders")
+        border = ET.SubElement(borders, f"{{{ns}}}border")
+        for side in ('left', 'right', 'top', 'bottom'):
+            ET.SubElement(border, f"{{{ns}}}{side}").set('style', style)
+        ET.SubElement(border, f"{{{ns}}}diagonal")
+        borders.set('count', str(len(borders)))
+        return len(borders) - 1
+
+    @staticmethod
+    def _argb(color):
+        """Normalize ``"RRGGBB"``/``"#RRGGBB"``/8-digit ARGB to ARGB hex."""
+        color = color.lstrip('#').upper()
+        return color if len(color) == 8 else f"FF{color}"
 
     def _numfmt_id_for(self, num_fmts, format_code):
         """Return the numFmtId for ``format_code``, creating a numFmt if needed."""
@@ -569,6 +699,89 @@ class XLSXPackage:
         abs_col = table['start_indices'][1] + table['columns'][col_name]
         return self.get_cell(table['sheet'], indices_to_cell(abs_row, abs_col))
 
+    def write_range(self, sheet_name, start_ref, rows, *, style_id=None):
+        """Write a 2D block of values starting at ``start_ref``, one pass.
+
+        ``rows`` is an iterable of row iterables. ``None`` entries leave the
+        existing cell untouched. Much faster than per-cell ``update_cell``
+        for large blocks: the sheet tree is resolved once and each row's
+        cells are merged and re-sorted in a single operation.
+        """
+        ns = self.NS['main']
+        sheet_data = self._sheet_root(sheet_name).find(f".//{{{ns}}}sheetData")
+        top, left = cell_to_indices(start_ref)
+        wrote = False
+        for r_off, row_values in enumerate(rows):
+            row_values = list(row_values)
+            if all(v is None for v in row_values):
+                continue
+            row = self._row_get_or_create(sheet_data, top + r_off + 1)
+            existing = {c.get('r'): c for c in row}
+            for c_off, value in enumerate(row_values):
+                if value is None:
+                    continue
+                ref = indices_to_cell(top + r_off, left + c_off)
+                cell = existing.get(ref)
+                if cell is None:
+                    cell = ET.SubElement(row, f"{{{ns}}}c")
+                    cell.set('r', ref)
+                    existing[ref] = cell
+                self._apply_bulk_value(cell, value, style_id)
+                wrote = True
+            row[:] = sorted(row, key=lambda c: cell_to_indices(c.get('r'))[1])
+        if wrote:
+            self._set_full_calc_on_load()
+
+    def _apply_bulk_value(self, cell, value, style_id):
+        """Set one bulk-write cell: style (or auto date style) + value."""
+        if style_id is None and isinstance(value, datetime.date):
+            try:
+                style_id = self._default_date_style(value)
+            except FileNotFoundError:
+                pass  # no styles part: write the serial unformatted
+        if style_id is not None:
+            cell.set('s', str(style_id))
+        self._set_cell_value(cell, value)
+
+    def get_range(self, sheet_name, ref):
+        """Read a rectangular range as a list of rows (missing cells → None)."""
+        ns = self.NS['main']
+        path = self.sheet_map.get(sheet_name, sheet_name)
+        if path in self.trees:
+            root = self.trees[path].getroot()
+        else:
+            with zipfile.ZipFile(self.filename, 'r') as zin:
+                with zin.open(path) as handle:
+                    root = ET.parse(handle).getroot()
+        start, end = ref.split(':')
+        top, left = cell_to_indices(start)
+        bottom, right = cell_to_indices(end)
+        sheet_data = root.find(f".//{{{ns}}}sheetData")
+        by_row = {int(r.get('r')): r for r in sheet_data}
+        result = []
+        for row_idx in range(top, bottom + 1):
+            row = by_row.get(row_idx + 1)
+            cells = {} if row is None else {c.get('r'): c for c in row}
+            result.append([
+                None if cells.get(indices_to_cell(row_idx, col)) is None
+                else self._cell_value(cells[indices_to_cell(row_idx, col)])
+                for col in range(left, right + 1)
+            ])
+        return result
+
+    def iter_table_rows(self, table_name):
+        """Yield each table data row as a ``{column_name: value}`` dict."""
+        table = self.table_map[table_name]
+        top, left = table['start_indices']
+        bottom, right = cell_to_indices(table['range'][1])
+        if bottom == top:
+            return  # header-only table
+        names = sorted(table['columns'], key=table['columns'].get)
+        data_ref = (f"{indices_to_cell(top + 1, left)}:"
+                    f"{indices_to_cell(bottom, right)}")
+        for row_values in self.get_range(table['sheet'], data_ref):
+            yield dict(zip(names, row_values))
+
     # pylint: disable=too-many-return-statements
     def _cell_value(self, cell):
         """Convert a ``<c>`` element into a Python value."""
@@ -590,7 +803,11 @@ class XLSXPackage:
             return value.text == '1'
         if cell_type in ('str', 'e'):
             return value.text
-        return self._parse_number(value.text)
+        number = self._parse_number(value.text)
+        style = cell.get('s')
+        if style is not None and int(style) in self._date_style_ids():
+            return self._from_excel_serial(number)
+        return number
 
     @staticmethod
     def _parse_number(text):
@@ -599,6 +816,43 @@ class XLSXPackage:
             return int(text)
         except ValueError:
             return float(text)
+
+    def _date_style_ids(self):
+        """Return the set of ``cellXfs`` indexes whose number format is a date."""
+        if self._date_style_cache is None:
+            ns = self.NS['main']
+            self._date_style_cache = set()
+            root = self._styles_root_readonly()
+            if root is not None:
+                custom = {
+                    int(e.get('numFmtId')): e.get('formatCode') or ''
+                    for fmts in root.findall(f"{{{ns}}}numFmts")
+                    for e in fmts.findall(f"{{{ns}}}numFmt")
+                }
+                cell_xfs = root.find(f"{{{ns}}}cellXfs")
+                for idx, xf_node in enumerate(cell_xfs if cell_xfs is not None else []):
+                    fmt_id = int(xf_node.get('numFmtId', '0'))
+                    if fmt_id in _BUILTIN_DATE_FMTS or \
+                            self._format_is_datish(custom.get(fmt_id, '')):
+                        self._date_style_cache.add(idx)
+        return self._date_style_cache
+
+    def _styles_root_readonly(self):
+        """Return the styles root without pulling it into the modified set."""
+        if 'xl/styles.xml' in self.trees:
+            return self.trees['xl/styles.xml'].getroot()
+        with zipfile.ZipFile(self.filename, 'r') as zin:
+            try:
+                with zin.open('xl/styles.xml') as handle:
+                    return ET.parse(handle).getroot()
+            except KeyError:
+                return None
+
+    @staticmethod
+    def _format_is_datish(code):
+        """True if a custom format code renders dates/times (y/m/d/h/s tokens)."""
+        stripped = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', '', code)
+        return any(ch in 'ymdhs' for ch in stripped.lower())
 
     def _shared_strings_list(self):
         """Lazily load ``xl/sharedStrings.xml`` as a list of plain strings."""
