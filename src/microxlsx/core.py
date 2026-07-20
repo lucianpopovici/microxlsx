@@ -350,6 +350,8 @@ class XLSXPackage:
         self._shift_merged_cells(root, box, delta, axis)
         self._rewrite_range_features(root, table['sheet'], box, delta=delta, axis=axis)
         self._rewrite_defined_names(table['sheet'], box, delta=delta, axis=axis)
+        # Rewritten formulas leave cached <v> results stale; force a recalc.
+        self._set_full_calc_on_load()
 
         new_top = top + (delta if axis == 0 else 0)
         new_left = left + (delta if axis == 1 else 0)
@@ -500,6 +502,25 @@ class XLSXPackage:
         else:
             col += delta
         return f"{c_abs}{indices_to_cell(0, col)[:-1]}{r_abs}{row + 1}"
+
+    def _set_full_calc_on_load(self):
+        """Flag the workbook so Excel recalculates on open (clears stale caches)."""
+        ns = self.NS['main']
+        workbook = self.trees.get('xl/workbook.xml')
+        if workbook is None:
+            return
+        root = workbook.getroot()
+        calc_pr = root.find(f"{{{ns}}}calcPr")
+        if calc_pr is None:
+            calc_pr = ET.Element(f"{{{ns}}}calcPr")
+            # calcPr follows definedNames (or sheets) in the schema order.
+            anchor = root.find(f"{{{ns}}}definedNames")
+            if anchor is None:
+                anchor = root.find(f"{{{ns}}}sheets")
+            children = list(root)
+            idx = children.index(anchor) + 1 if anchor is not None else len(children)
+            root.insert(idx, calc_pr)
+        calc_pr.set('fullCalcOnLoad', '1')
 
     @staticmethod
     def _shift_range_ref(ref, box, delta, axis):

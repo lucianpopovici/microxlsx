@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Named ranges** (workbook `definedName` entries) whose range points into
     the moved block shift, matched to the moving table's sheet and treating a
     sheet-qualified range as one unit.
+  - After a move rewrites formulas, the workbook is flagged
+    `calcPr fullCalcOnLoad="1"` so Excel recomputes on open and no stale cached
+    `<v>` result is trusted.
 
 ### Notes
 
