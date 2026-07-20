@@ -1408,12 +1408,15 @@ class TestDateValues:
     def test_date_serial(self, tmp_path):
         pkg = XLSXPackage(make_styles_xlsx(tmp_path))
         pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
-        assert pkg.get_cell("Sheet1", "A1") == 45306  # Excel serial
+        assert self._cell(pkg, "A1").find(f"{{{NS}}}v").text == "45306"  # serial
+        # get_cell sees the date number format and converts back.
+        assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
 
     def test_datetime_serial_has_time_fraction(self, tmp_path):
         pkg = XLSXPackage(make_styles_xlsx(tmp_path))
         pkg.update_cell("Sheet1", "A1", value=datetime.datetime(2024, 1, 15, 6))
-        assert pkg.get_cell("Sheet1", "A1") == 45306.25  # 6h = 0.25 day
+        assert self._cell(pkg, "A1").find(f"{{{NS}}}v").text == "45306.25"
+        assert pkg.get_cell("Sheet1", "A1") == datetime.datetime(2024, 1, 15, 6)
 
     def test_date_cell_is_numeric_not_text(self, tmp_path):
         pkg = XLSXPackage(make_styles_xlsx(tmp_path))
@@ -1724,3 +1727,190 @@ class TestRemoveTable:
         pkg.remove_table("T1")
         out, _ = _reopen(tmp_path, pkg)
         assert b"table1.xml" not in _read(out, "xl/worksheets/_rels/sheet1.xml.rels")
+
+
+def make_date1904_xlsx(tmp_path):
+    """The styles fixture with workbookPr date1904 switched on."""
+    src = make_styles_xlsx(tmp_path)
+    path = str(tmp_path / "d1904.xlsx")
+    workbook = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships"><workbookPr date1904="1"/>'
+        b'<sheets><sheet name="Sheet1" r:id="rId1"/></sheets></workbook>'
+    )
+    with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(path, "w") as zout:
+        for name in zin.namelist():
+            zout.writestr(name, workbook if name == "xl/workbook.xml" else zin.read(name))
+    return path
+
+
+class TestWriteRange:
+    def test_block_written_and_read_back(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.write_range("Sheet1", "B2", [["a", 1], ["b", 2.5]])
+        assert pkg.get_range("Sheet1", "B2:C3") == [["a", 1], ["b", 2.5]]
+
+    def test_none_skips_cell(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "C2", value="keep")
+        pkg.write_range("Sheet1", "B2", [["new", None]])
+        assert pkg.get_cell("Sheet1", "C2") == "keep"
+
+    def test_merges_with_existing_cells_sorted(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "D1", value="pre")
+        pkg.write_range("Sheet1", "A1", [[1, 2]])
+        row = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f".//{{{NS}}}row[@r='1']")
+        refs = [c.get("r") for c in row]
+        assert refs == ["A1", "B1", "D1"]  # sorted, D1 preserved
+
+    def test_style_id_applied_to_block(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        fmt = pkg.add_number_format("0.00")
+        pkg.write_range("Sheet1", "A1", [[1, 2]], style_id=fmt)
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f".//{{{NS}}}c[@r='B1']").get("s") == str(fmt)
+
+    def test_dates_in_block_auto_formatted(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.write_range("Sheet1", "A1", [[datetime.date(2024, 1, 15)]])
+        assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
+
+    def test_flags_recalc(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.write_range("Sheet1", "A1", [[1]])
+        assert pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}calcPr") is not None
+
+    def test_save_roundtrip(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.write_range("Sheet1", "B2", [["x", 1], ["y", 2]])
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        assert XLSXPackage(out).get_range("Sheet1", "B2:C3") == [["x", 1], ["y", 2]]
+
+
+class TestGetRange:
+    def test_missing_cells_are_none(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        block = pkg.get_range("Sheet1", "C1:D2")
+        assert block == [["Inline", 42], [None, None]]
+
+    def test_read_only_does_not_pollute_trees(self, tmp_path):
+        pkg = XLSXPackage(make_read_xlsx(tmp_path))
+        pkg.get_range("Sheet1", "A1:B1")
+        assert pkg.sheet_map["Sheet1"] not in pkg.trees
+
+
+class TestIterTableRows:
+    def test_yields_dicts_in_column_order(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.append_table_row("Top", {"Top_c1": "a", "Top_c2": 1})
+        rows = list(pkg.iter_table_rows("Top"))
+        assert rows[-1] == {"Top_c1": "a", "Top_c2": 1}
+        assert len(rows) == 3  # A1:B4 after append -> 3 data rows
+
+    def test_header_only_table_yields_nothing(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "H", "D1:E1", ["p", "q"])
+        assert not list(pkg.iter_table_rows("H"))
+
+
+class TestAddStyle:
+    def _styles(self, pkg):
+        return pkg.trees["xl/styles.xml"].getroot()
+
+    def test_returns_distinct_ids_and_dedups(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        a = pkg.add_style(bold=True)
+        b = pkg.add_style(bold=True)
+        c = pkg.add_style(italic=True)
+        assert a == b and a != c
+
+    def test_font_attributes(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(bold=True, font_size=14, font_name="Arial",
+                            font_color="#FF0000")
+        xf = self._styles(pkg).find(f"{{{NS}}}cellXfs")[sid]
+        font = self._styles(pkg).find(f"{{{NS}}}fonts")[int(xf.get("fontId"))]
+        assert font.find(f"{{{NS}}}b") is not None
+        assert font.find(f"{{{NS}}}sz").get("val") == "14"
+        assert font.find(f"{{{NS}}}name").get("val") == "Arial"
+        assert font.find(f"{{{NS}}}color").get("rgb") == "FFFF0000"
+
+    def test_fill_and_border(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(fill_color="DDEBF7", border="thin")
+        xf = self._styles(pkg).find(f"{{{NS}}}cellXfs")[sid]
+        fill = self._styles(pkg).find(f"{{{NS}}}fills")[int(xf.get("fillId"))]
+        assert fill.find(f".//{{{NS}}}fgColor").get("rgb") == "FFDDEBF7"
+        border = self._styles(pkg).find(f"{{{NS}}}borders")[int(xf.get("borderId"))]
+        assert border.find(f"{{{NS}}}left").get("style") == "thin"
+
+    def test_alignment_and_number_format(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        sid = pkg.add_style(number_format="0%", align="center", valign="top",
+                            wrap=True)
+        xf = self._styles(pkg).find(f"{{{NS}}}cellXfs")[sid]
+        assert xf.get("applyNumberFormat") == "1"
+        alignment = xf.find(f"{{{NS}}}alignment")
+        assert alignment.get("horizontal") == "center"
+        assert alignment.get("vertical") == "top"
+        assert alignment.get("wrapText") == "1"
+
+    def test_counts_stay_in_sync(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_style(bold=True, fill_color="EEEEEE", border="thin")
+        root = self._styles(pkg)
+        for tag in ("fonts", "fills", "borders", "cellXfs"):
+            el = root.find(f"{{{NS}}}{tag}")
+            assert el.get("count") == str(len(el))
+
+    def test_raises_without_styles_part(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            pkg.add_style(bold=True)
+
+
+class TestDateRoundTrip:
+    def test_reopened_file_reads_date(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        assert XLSXPackage(out).get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
+
+    def test_builtin_date_format_detected(self, tmp_path):
+        # A style using builtin numFmtId 14 (m/d/yyyy) with no custom numFmts.
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        # Registering any format loads styles.xml; then append a builtin-id xf.
+        pkg.add_number_format("0.00")
+        cell_xfs = pkg.trees["xl/styles.xml"].getroot().find(f"{{{NS}}}cellXfs")
+        xf = ET.SubElement(cell_xfs, f"{{{NS}}}xf")
+        for attr, val in (("numFmtId", "14"), ("fontId", "0"), ("fillId", "0"),
+                          ("borderId", "0"), ("xfId", "0"),
+                          ("applyNumberFormat", "1")):
+            xf.set(attr, val)
+        cell_xfs.set("count", str(len(cell_xfs)))
+        sid = len(cell_xfs) - 1
+        pkg.update_cell("Sheet1", "A1", value=45306, style_id=sid)
+        assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)
+
+    def test_plain_number_not_converted(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        fmt = pkg.add_number_format("#,##0.00")
+        pkg.update_cell("Sheet1", "A1", value=45306, style_id=fmt)
+        assert pkg.get_cell("Sheet1", "A1") == 45306  # money format, not a date
+
+    def test_1904_serial_written(self, tmp_path):
+        pkg = XLSXPackage(make_date1904_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        v = root.find(f".//{{{NS}}}c[@r='A1']/{{{NS}}}v")
+        assert v.text == "43844"  # days since 1904-01-01, not 45306
+
+    def test_1904_round_trip(self, tmp_path):
+        pkg = XLSXPackage(make_date1904_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "A1", value=datetime.date(2024, 1, 15))
+        assert pkg.get_cell("Sheet1", "A1") == datetime.date(2024, 1, 15)

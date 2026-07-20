@@ -46,6 +46,21 @@ pkg.update_cell("Sheet1", "F10", value=datetime.date(2026, 1, 31))  # auto date 
 money = pkg.add_number_format("$#,##0.00")
 pkg.update_cell("Sheet1", "G10", value=1999.9, style_id=money)
 
+# Compose full cell styles: font, fill, border, alignment
+header = pkg.add_style(bold=True, fill_color="#DDEBF7", border="thin",
+                       align="center")
+pkg.update_cell("Sheet1", "A1", value="Report", style_id=header)
+
+# Bulk block writes/reads — one tree pass instead of a call per cell
+pkg.write_range("Sheet1", "B2", [
+    ["Region", "Amount", "When"],
+    ["West",   320.5,    datetime.date(2026, 1, 31)],
+    ["East",   210.0,    datetime.date(2026, 2, 28)],
+])
+block = pkg.get_range("Sheet1", "B2:D4")
+for row in pkg.iter_table_rows("SalesTable"):   # dicts keyed by column name
+    print(row["Region"], row["Amount"])
+
 # Inspect, append rows, clear cells, size columns/rows
 pkg.sheet_names(); pkg.table_names(); pkg.table_dimensions("SalesTable")
 pkg.append_table_row("SalesTable", {"Region": "West", "Amount": 320})
@@ -70,7 +85,11 @@ of the way (minimal, cascading) — the same collision handling as `resize_table
 formula cell's cached result), or `None` for an empty cell. Reading a sheet you
 haven't modified doesn't disturb it — it's still streamed through untouched on
 save. `datetime.date` / `datetime.datetime` values are written as Excel serial
-numbers and auto-formatted (pass an explicit `style_id` to override).
+numbers and auto-formatted (pass an explicit `style_id` to override) — and read
+**back** as `date`/`datetime` when the cell carries a date number format, so
+dates round-trip. The Mac 1904 date system (`workbookPr date1904`) is honoured
+in both directions. `None` entries in a `write_range` block leave the existing
+cells untouched.
 `add_number_format` registers a custom format in `xl/styles.xml` and returns a
 reusable `style_id`. Editing a formula (or a value a formula depends on)
 invalidates the cached results — the workbook is flagged for recalculation, and
