@@ -326,7 +326,7 @@ class XLSXPackage:
                 new_col = col if axis == 0 else col + delta
                 self._relocate_cell(
                     sheet_data, row, indices_to_cell(row_idx, col),
-                    new_row_idx, new_col
+                    new_row_idx=new_row_idx, new_col=new_col
                 )
 
         new_top = top + (delta if axis == 0 else 0)
@@ -342,7 +342,7 @@ class XLSXPackage:
             'ref', f"{table['range'][0]}:{table['range'][1]}"
         )
 
-    def _relocate_cell(self, sheet_data, src_row, old_ref, new_row_idx, new_col):
+    def _relocate_cell(self, sheet_data, src_row, old_ref, *, new_row_idx, new_col):
         """Move a single cell from ``old_ref`` to (new_row_idx, new_col)."""
         ns = self.NS['main']
         cell = src_row.find(f"{{{ns}}}c[@r='{old_ref}']")
