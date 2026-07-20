@@ -328,6 +328,38 @@ def make_named_range_xlsx(tmp_path):
     return path
 
 
+def make_calcpr_xlsx(tmp_path):
+    """XLSX whose workbook.xml already has a calcPr (with a calcId to preserve)."""
+    path = str(tmp_path / "calcpr.xlsx")
+    workbook_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<workbook xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main"'
+        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+        b'2006/relationships">'
+        b'<sheets><sheet name="Sheet1" r:id="rId1"/></sheets>'
+        b'<calcPr calcId="191029"/>'
+        b"</workbook>"
+    )
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b'<sheetData><row r="5"><c r="B5"><f>A5*2</f><v>0</v></c></row></sheetData>'
+        b"</worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2")
+        )
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
 def make_xlsx(tmp_path, *, with_table=False):
     """Create a minimal in-memory XLSX (ZIP) file for testing."""
     path = str(tmp_path / "test.xlsx")
@@ -968,3 +1000,44 @@ class TestDefinedNames:
             wb = zf.read("xl/workbook.xml").decode("utf-8")
         assert "Sheet1!$A$7:$A$9" in wb
         assert "Sheet2!$A$5:$A$7" in wb
+
+
+class TestFullCalcOnLoad:
+    def _calc_pr(self, pkg):
+        root = pkg.trees["xl/workbook.xml"].getroot()
+        return root.find(f"{{{NS}}}calcPr")
+
+    def test_calc_pr_created_on_move(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        assert self._calc_pr(pkg) is None  # workbook has none to start
+        pkg.resize_table("Top", add_rows=3)  # moves Bottom
+        assert self._calc_pr(pkg).get("fullCalcOnLoad") == "1"
+
+    def test_existing_calc_pr_preserved(self, tmp_path):
+        pkg = XLSXPackage(make_calcpr_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        calc_pr = self._calc_pr(pkg)
+        assert calc_pr.get("fullCalcOnLoad") == "1"
+        assert calc_pr.get("calcId") == "191029"  # existing attrs kept
+
+    def test_calc_pr_placed_after_defined_names(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        root = pkg.trees["xl/workbook.xml"].getroot()
+        tags = [child.tag.split("}")[-1] for child in root]
+        assert tags.index("calcPr") == tags.index("definedNames") + 1
+
+    def test_no_move_leaves_workbook_untouched(self, tmp_path):
+        # A pure shrink moves nothing, so no recalc flag is added.
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Bottom", add_rows=-1)
+        assert self._calc_pr(pkg) is None
+
+    def test_save_roundtrip_persists(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            wb = zf.read("xl/workbook.xml").decode("utf-8")
+        assert 'fullCalcOnLoad="1"' in wb

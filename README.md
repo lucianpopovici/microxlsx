@@ -70,3 +70,8 @@ formulas, styles) is relocated, and references follow the data:
 **Structured table references** (`Table[Col]`) resolve by name through the
 table definition, so they follow moves and resizes automatically — no rewriting
 needed. Ranges that only *partially* overlap the moved block are left unchanged.
+
+Because moves rewrite formula text but don't recompute cached results, the
+workbook is flagged for a full recalculation on load (`fullCalcOnLoad`) so no
+stale cached value is trusted. Shared strings and shared formulas are preserved
+as-is and need no special handling.
