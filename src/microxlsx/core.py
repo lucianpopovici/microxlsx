@@ -340,6 +340,7 @@ class XLSXPackage:
         # References that pointed into the moved block follow it to its new home.
         self._rewrite_formulas(sheet_data, table['sheet'], box, delta=delta, axis=axis)
         self._shift_merged_cells(root, box, delta, axis)
+        self._rewrite_range_features(root, table['sheet'], box, delta=delta, axis=axis)
 
         new_top = top + (delta if axis == 0 else 0)
         new_left = left + (delta if axis == 1 else 0)
@@ -404,6 +405,38 @@ class XLSXPackage:
             moved = self._shift_range_ref(merge.get('ref'), box, delta, axis)
             if moved is not None:
                 merge.set('ref', moved)
+
+    def _rewrite_range_features(self, root, sheet_name, box, *, delta, axis):
+        """Shift conditional-formatting / data-validation regions + formulas."""
+        ns = self.NS['main']
+        for cf_node in root.findall(f"{{{ns}}}conditionalFormatting"):
+            self._shift_sqref(cf_node, box, delta, axis)
+            for formula in cf_node.iter(f"{{{ns}}}formula"):
+                if formula.text:
+                    formula.text = self._shift_formula_refs(
+                        formula.text, sheet_name, box, delta=delta, axis=axis
+                    )
+        validations = root.find(f"{{{ns}}}dataValidations")
+        if validations is not None:
+            for dv_node in validations.findall(f"{{{ns}}}dataValidation"):
+                self._shift_sqref(dv_node, box, delta, axis)
+                for tag in ('formula1', 'formula2'):
+                    node = dv_node.find(f"{{{ns}}}{tag}")
+                    if node is not None and node.text:
+                        node.text = self._shift_formula_refs(
+                            node.text, sheet_name, box, delta=delta, axis=axis
+                        )
+
+    def _shift_sqref(self, elem, box, delta, axis):
+        """Shift each fully-contained range in a space-separated ``sqref``."""
+        sqref = elem.get('sqref')
+        if not sqref:
+            return
+        parts = [
+            self._shift_range_ref(part, box, delta, axis) or part
+            for part in sqref.split()
+        ]
+        elem.set('sqref', ' '.join(parts))
 
     @staticmethod
     def _shift_range_ref(ref, box, delta, axis):

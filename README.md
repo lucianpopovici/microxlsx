@@ -62,6 +62,7 @@ formulas, styles) is relocated, and references follow the data:
     Function names, cross-sheet references, and cells outside the moved block
     are left untouched.
   * **Merged-cell ranges** contained in the moved block shift with it.
+  * **Conditional-formatting** and **data-validation** regions (their `sqref`)
+    and the formulas inside their rules shift with the moved block.
 
-Not yet rewritten: conditional-formatting / data-validation ranges, structured
-table references (`Table[Col]`), and named ranges.
+Not yet rewritten: structured table references (`Table[Col]`) and named ranges.

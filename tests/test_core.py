@@ -242,6 +242,48 @@ def make_hformula_xlsx(tmp_path):
     return path
 
 
+def make_cfdv_xlsx(tmp_path):
+    """XLSX with conditional formatting + data validation for move testing.
+
+    Tables Top (A1:B3) and Bottom (A5:B7) in cols A-B. A CF region and a data
+    validation cover Bottom; a second CF covers Top (which never moves).
+    """
+    path = str(tmp_path / "cfdv.xlsx")
+    sheet_xml = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/'
+        b'spreadsheetml/2006/main">'
+        b"<sheetData>"
+        b'<row r="5"><c r="A5" t="inlineStr"><is><t>x</t></is></c></row>'
+        b"</sheetData>"
+        b'<conditionalFormatting sqref="A5:B7">'
+        b'<cfRule type="expression" priority="1"><formula>A5&gt;0</formula></cfRule>'
+        b"</conditionalFormatting>"
+        b'<conditionalFormatting sqref="A1:B3">'
+        b'<cfRule type="expression" priority="2"><formula>A1&gt;0</formula></cfRule>'
+        b"</conditionalFormatting>"
+        b'<conditionalFormatting sqref="A6:B6 D1:D2">'
+        b'<cfRule type="expression" priority="3"><formula>1</formula></cfRule>'
+        b"</conditionalFormatting>"
+        b'<dataValidations count="1">'
+        b'<dataValidation type="whole" operator="greaterThan" sqref="A5:A7">'
+        b"<formula1>A5</formula1>"
+        b"</dataValidation>"
+        b"</dataValidations>"
+        b"</worksheet>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("xl/workbook.xml", WORKBOOK_XML)
+        zf.writestr("xl/_rels/workbook.xml.rels", WORKBOOK_RELS_XML)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels", _sheet_rels("rId1", "rId2")
+        )
+        zf.writestr("xl/tables/table1.xml", _table_xml(b"Top", b"A1:B3"))
+        zf.writestr("xl/tables/table2.xml", _table_xml(b"Bottom", b"A5:B7"))
+    return path
+
+
 def make_xlsx(tmp_path, *, with_table=False):
     """Create a minimal in-memory XLSX (ZIP) file for testing."""
     path = str(tmp_path / "test.xlsx")
@@ -777,3 +819,60 @@ class TestFormulaMergeRewrite:
             sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
         assert "SUM(A7:A9)" in sheet
         assert "A7:B7" in sheet
+
+
+class TestConditionalFormattingDataValidation:
+    def _root(self, pkg):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+
+    def _cf_map(self, pkg):
+        out = {}
+        for cf in self._root(pkg).findall(f"{{{NS}}}conditionalFormatting"):
+            formula = cf.find(f".//{{{NS}}}formula")
+            out[cf.get("sqref")] = None if formula is None else formula.text
+        return out
+
+    def _dv(self, pkg):
+        return self._root(pkg).find(f".//{{{NS}}}dataValidation")
+
+    def test_cf_region_over_moved_table_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)  # Bottom shifts down 2
+        cf = self._cf_map(pkg)
+        assert "A7:B9" in cf
+        assert cf["A7:B9"] == "A7>0"  # rule formula followed too
+
+    def test_cf_region_over_static_table_untouched(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        cf = self._cf_map(pkg)
+        assert cf.get("A1:B3") == "A1>0"
+
+    def test_data_validation_region_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        dv = self._dv(pkg)
+        assert dv.get("sqref") == "A7:A9"
+
+    def test_data_validation_formula_shifts(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        dv = self._dv(pkg)
+        assert dv.find(f"{{{NS}}}formula1").text == "A7"
+
+    def test_multi_range_sqref_partial_shift(self, tmp_path):
+        # A CF whose sqref lists one range inside Bottom (A6:B6) and one
+        # outside (D1:D2): only the contained range shifts.
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        assert "A8:B8 D1:D2" in self._cf_map(pkg)
+
+    def test_save_roundtrip_persists(self, tmp_path):
+        pkg = XLSXPackage(make_cfdv_xlsx(tmp_path))
+        pkg.resize_table("Top", add_rows=3)
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            sheet = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        assert 'sqref="A7:B9"' in sheet
+        assert 'sqref="A7:A9"' in sheet
