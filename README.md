@@ -55,5 +55,13 @@ pkg.save("output.xlsx")
 
 Column growth also appends `tableColumn` metadata (with unique ids/names) and
 writes the new header cells. When a table is moved, its cell block (values,
-formulas, styles) is relocated, but formula *references* into the moved region,
-merged-cell ranges, and conditional-formatting ranges are not yet rewritten.
+formulas, styles) is relocated, and references follow the data:
+
+  * **Formulas** anywhere on the sheet that point at a moved cell are rewritten
+    to its new location — including `$`-absolute refs and range endpoints.
+    Function names, cross-sheet references, and cells outside the moved block
+    are left untouched.
+  * **Merged-cell ranges** contained in the moved block shift with it.
+
+Not yet rewritten: conditional-formatting / data-validation ranges, structured
+table references (`Table[Col]`), and named ranges.
