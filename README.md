@@ -38,19 +38,22 @@ pkg.save("output.xlsm")
 
 ** 📐 Resizing tables with minimal movement
 
-`resize_table` grows (or shrinks) a table by a number of rows. When growing,
-any tables that would collide below it are shoved **down by the minimal amount**
-needed to clear the target, cascading through further tables. Tables in other
-columns, or with an existing gap, are left untouched.
+`resize_table` grows (or shrinks) a table by a number of rows and/or columns.
+When growing, any tables that would collide are shoved by the **minimal amount**
+needed to clear the target — **down** for row growth, **right** for column
+growth — cascading through further tables. Tables that don't overlap on the
+cross axis, or that have an existing gap, are left untouched.
 
 ```python
 pkg = XLSXPackage("report.xlsx")
-pkg.resize_table("SalesTable", add_rows=5)   # grow, push colliding tables down
-pkg.resize_table("Notes", add_rows=-2)       # shrink (never moves other tables)
+pkg.resize_table("SalesTable", add_rows=5)            # grow rows, push down
+pkg.resize_table("SalesTable", add_cols=2)            # grow cols, push right
+pkg.resize_table("SalesTable", add_rows=3, add_cols=1)  # both at once
+pkg.resize_table("Notes", add_rows=-2)               # shrink (never moves others)
 pkg.save("output.xlsx")
 ```
 
-Current scope: row-axis resizing only. When a table is moved, its cell block
-(values, formulas, styles) is relocated, but formula *references* into the
-moved region, merged-cell ranges, and conditional-formatting ranges are not
-yet rewritten. Column-axis resizing is planned.
+Column growth also appends `tableColumn` metadata (with unique ids/names) and
+writes the new header cells. When a table is moved, its cell block (values,
+formulas, styles) is relocated, but formula *references* into the moved region,
+merged-cell ranges, and conditional-formatting ranges are not yet rewritten.
