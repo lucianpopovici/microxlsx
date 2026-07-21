@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `add_hyperlink(sheet, cell, url, tooltip=)` — attach an external hyperlink
+  (worksheet `hyperlink` + external relationship).
+- `add_image(sheet, cell, image, width=, height=)` — anchor a PNG/JPEG (path or
+  bytes) via a media part + DrawingML anchor + relationships; PNG dimensions
+  are auto-detected.
+- `add_comment(sheet, cell, text, author=)` — attach a cell note (comments part
+  + VML drawing + `legacyDrawing`); multiple comments per sheet and repeated
+  authors are handled.
 - `set_auto_filter(sheet, ref)` adds worksheet filter dropdowns; new tables
   from `add_table` include an autoFilter by default, kept in sync with the
   table's `ref` through resize / move / insert / delete.

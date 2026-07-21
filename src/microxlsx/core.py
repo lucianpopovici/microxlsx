@@ -23,8 +23,9 @@ _WS_ORDER = (
     'mergeCells', 'phoneticPr', 'conditionalFormatting', 'dataValidations',
     'hyperlinks', 'printOptions', 'pageMargins', 'pageSetup', 'headerFooter',
     'rowBreaks', 'colBreaks', 'customProperties', 'cellWatches',
-    'ignoredErrors', 'smartTags', 'drawing', 'drawingHF', 'picture',
-    'oleObjects', 'controls', 'webPublishItems', 'tableParts', 'extLst',
+    'ignoredErrors', 'smartTags', 'drawing', 'legacyDrawing',
+    'legacyDrawingHF', 'drawingHF', 'picture', 'oleObjects', 'controls',
+    'webPublishItems', 'tableParts', 'extLst',
 )
 
 # Built-in number-format ids that render as dates/times (ECMA-376 §18.8.30).
@@ -76,10 +77,18 @@ class XLSXPackage:
                     'spreadsheetml.worksheet+xml')
     CT_TABLE = ('application/vnd.openxmlformats-officedocument.'
                 'spreadsheetml.table+xml')
-    REL_WORKSHEET = ('http://schemas.openxmlformats.org/officeDocument/'
-                     '2006/relationships/worksheet')
-    REL_TABLE = ('http://schemas.openxmlformats.org/officeDocument/'
-                 '2006/relationships/table')
+    _REL_BASE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+    REL_WORKSHEET = _REL_BASE + 'worksheet'
+    REL_TABLE = _REL_BASE + 'table'
+    REL_HYPERLINK = _REL_BASE + 'hyperlink'
+    REL_COMMENTS = _REL_BASE + 'comments'
+    REL_VML = _REL_BASE + 'vmlDrawing'
+    REL_DRAWING = _REL_BASE + 'drawing'
+    REL_IMAGE = _REL_BASE + 'image'
+    _CT_BASE = 'application/vnd.openxmlformats-officedocument.'
+    CT_COMMENTS = _CT_BASE + 'spreadsheetml.comments+xml'
+    CT_VML = _CT_BASE + 'vmlDrawing'
+    CT_DRAWING = _CT_BASE + 'drawing+xml'
 
     def __init__(self, filename):
         self.filename = filename
@@ -95,6 +104,8 @@ class XLSXPackage:
         self._dropped_parts = set()
         self._ct_add = {}
         self._ct_remove = set()
+        self._added_bytes = {}
+        self._comment_state = {}
         for prefix, uri in self.NS.items():
             ET.register_namespace(prefix if prefix != 'main' else '', uri)
         self._build_maps()
@@ -384,10 +395,11 @@ class XLSXPackage:
         head, _, tail = sheet_path.rpartition('/')
         return f"{head}/_rels/{tail}.rels" if head else f"_rels/{tail}.rels"
 
-    def _next_part_number(self, prefix):
-        """Return the next free integer for ``{prefix}N.xml`` part names."""
-        pattern = re.compile(re.escape(prefix) + r'(\d+)\.xml$')
-        candidates = (self._source_parts | set(self.trees)) - self._dropped_parts
+    def _next_part_number(self, prefix, suffix='.xml'):
+        """Return the next free integer for ``{prefix}N{suffix}`` part names."""
+        pattern = re.compile(re.escape(prefix) + r'(\d+)' + re.escape(suffix) + r'$')
+        candidates = ((self._source_parts | set(self.trees) | set(self._added_bytes))
+                      - self._dropped_parts)
         nums = [int(m.group(1)) for m in map(pattern.search, candidates) if m]
         return max(nums, default=0) + 1
 
@@ -914,6 +926,175 @@ class XLSXPackage:
         if allow_select:
             prot.set('selectLockedCells', '0')
             prot.set('selectUnlockedCells', '0')
+
+    def add_hyperlink(self, sheet_name, cell, url, *, tooltip=None):
+        """Attach an external hyperlink (``url``) to a cell."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        rid = self._add_sheet_rel(sheet_name, self.REL_HYPERLINK, url, external=True)
+        link = ET.SubElement(
+            self._ws_ordered_child(root, 'hyperlinks'), f"{{{ns}}}hyperlink")
+        link.set('ref', cell)
+        link.set(f"{{{self.NS['r']}}}id", rid)
+        if tooltip is not None:
+            link.set('tooltip', tooltip)
+
+    def add_image(self, sheet_name, cell, image, *, width=None, height=None):
+        """Anchor an image at ``cell``. ``image`` is a path or raw bytes.
+
+        ``width``/``height`` are in pixels; when omitted, PNG dimensions are
+        read from the file (other formats default to 96x96).
+        """
+        data, ext = self._read_image(image)
+        if width is None or height is None:
+            size = self._png_size(data)
+            width, height = size if size else (96, 96)
+        media = f"xl/media/image{self._next_part_number('xl/media/image', '.' + ext)}.{ext}"
+        self._added_bytes[media] = data
+        self._ct_add[f"/{media}"] = f"image/{'jpeg' if ext == 'jpg' else ext}"
+        self._anchor_image(sheet_name, cell, media,
+                           cx_emu=width * 9525, cy_emu=height * 9525)
+
+    def add_comment(self, sheet_name, cell, text, *, author=""):
+        """Attach a comment (legacy note) to a cell."""
+        ns = self.NS['main']
+        comments = self._comment_part(sheet_name)
+        authors = comments.getroot().find(f"{{{ns}}}authors")
+        names = [a.text for a in authors]
+        if author not in names:
+            ET.SubElement(authors, f"{{{ns}}}author").text = author
+            names.append(author)
+        clist = comments.getroot().find(f"{{{ns}}}commentList")
+        comment = ET.SubElement(clist, f"{{{ns}}}comment")
+        comment.set('ref', cell)
+        comment.set('authorId', str(names.index(author)))
+        run = ET.SubElement(ET.SubElement(comment, f"{{{ns}}}text"), f"{{{ns}}}r")
+        ET.SubElement(run, f"{{{ns}}}t").text = text
+        self._append_comment_shape(sheet_name, cell)
+
+    def _add_sheet_rel(self, sheet_name, rel_type, target, *, external=False):
+        """Append a relationship to a worksheet's rels; return its id."""
+        rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[sheet_name]))
+        rid = self._next_rid(rels.getroot())
+        rel = ET.SubElement(rels.getroot(), f"{{{self.REL_NS}}}Relationship")
+        rel.set('Id', rid)
+        rel.set('Type', rel_type)
+        rel.set('Target', target)
+        if external:
+            rel.set('TargetMode', 'External')
+        return rid
+
+    @staticmethod
+    def _read_image(image):
+        """Return (bytes, extension) for a path or raw image bytes."""
+        if isinstance(image, (bytes, bytearray)):
+            data = bytes(image)
+            ext = 'png' if data[:8] == b'\x89PNG\r\n\x1a\n' else 'jpg'
+            return data, ext
+        with open(image, 'rb') as handle:
+            data = handle.read()
+        ext = image.rsplit('.', 1)[-1].lower()
+        return data, ('jpg' if ext == 'jpeg' else ext)
+
+    @staticmethod
+    def _png_size(data):
+        """Return (width, height) in pixels for PNG bytes, else None."""
+        if data[:8] == b'\x89PNG\r\n\x1a\n' and data[12:16] == b'IHDR':
+            return int.from_bytes(data[16:20], 'big'), int.from_bytes(data[20:24], 'big')
+        return None
+
+    def _anchor_image(self, sheet_name, cell, media, *, cx_emu, cy_emu):
+        """Create a drawing part anchoring ``media`` at ``cell``."""
+        root = self._sheet_root(sheet_name)
+        drawing_path = f"xl/drawings/drawing{self._next_part_number('xl/drawings/drawing')}.xml"
+        row, col = cell_to_indices(cell)
+        xdr = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
+        aml = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        rns = self.NS['r']
+        self.trees[drawing_path] = ET.ElementTree(ET.fromstring(
+            f'<xdr:wsDr xmlns:xdr="{xdr}" xmlns:a="{aml}" xmlns:r="{rns}">'
+            f'<xdr:oneCellAnchor>'
+            f'<xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff>'
+            f'<xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            f'<xdr:ext cx="{cx_emu}" cy="{cy_emu}"/>'
+            f'<xdr:pic><xdr:nvPicPr>'
+            f'<xdr:cNvPr id="1" name="Image 1"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            f'<xdr:blipFill><a:blip r:embed="rId1"/>'
+            f'<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            f'<xdr:spPr><a:xfrm><a:off x="0" y="0"/>'
+            f'<a:ext cx="{cx_emu}" cy="{cy_emu}"/></a:xfrm>'
+            f'<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            f'</xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>'))
+        self._ct_add[f"/{drawing_path}"] = self.CT_DRAWING
+        drawing_rels = self._get_or_create_rels(
+            f"xl/drawings/_rels/{drawing_path.rsplit('/', 1)[-1]}.rels")
+        rel = ET.SubElement(drawing_rels.getroot(), f"{{{self.REL_NS}}}Relationship")
+        rel.set('Id', 'rId1')
+        rel.set('Type', self.REL_IMAGE)
+        rel.set('Target', f"../media/{media.rsplit('/', 1)[-1]}")
+        rid = self._add_sheet_rel(
+            sheet_name, self.REL_DRAWING, f"../drawings/{drawing_path.rsplit('/', 1)[-1]}")
+        self._ws_ordered_child(root, 'drawing').set(f"{{{self.NS['r']}}}id", rid)
+
+    def _comment_part(self, sheet_name):
+        """Ensure a comments part (+ VML + rels + legacyDrawing) for a sheet."""
+        ns = self.NS['main']
+        state = self._comment_state.get(sheet_name)
+        if state is not None:
+            return state['tree']
+        comments_path = f"xl/comments{self._next_part_number('xl/comments')}.xml"
+        tree = ET.ElementTree(ET.fromstring(
+            f'<comments xmlns="{ns}"><authors/><commentList/></comments>'))
+        self.trees[comments_path] = tree
+        self._ct_add[f"/{comments_path}"] = self.CT_COMMENTS
+        self._add_sheet_rel(sheet_name, self.REL_COMMENTS,
+                            f"../{comments_path.rsplit('/', 1)[-1]}")
+        vml_path = (f"xl/drawings/vmlDrawing"
+                    f"{self._next_part_number('xl/drawings/vmlDrawing', '.vml')}.vml")
+        self._ct_add[f"/{vml_path}"] = self.CT_VML
+        vml_rid = self._add_sheet_rel(
+            sheet_name, self.REL_VML, f"../drawings/{vml_path.rsplit('/', 1)[-1]}")
+        self._ws_ordered_child(self._sheet_root(sheet_name), 'legacyDrawing').set(
+            f"{{{self.NS['r']}}}id", vml_rid)
+        state = {'tree': tree, 'vml_path': vml_path, 'cells': []}
+        self._comment_state[sheet_name] = state
+        self._added_bytes[vml_path] = self._build_vml([])
+        return tree
+
+    def _append_comment_shape(self, sheet_name, cell):
+        """Append a VML note shape for ``cell`` and rebuild the sheet's VML."""
+        state = self._comment_state[sheet_name]
+        state['cells'].append(cell_to_indices(cell))
+        self._added_bytes[state['vml_path']] = self._build_vml(state['cells'])
+
+    @staticmethod
+    def _build_vml(cells):
+        """Build the VML drawing bytes holding one note shape per cell."""
+        shapes = []
+        for i, (row, col) in enumerate(cells, start=1):
+            shapes.append(
+                f'<v:shape id="_x0000_s{1000 + i}" type="#_x0000_t202"'
+                f' style="position:absolute;margin-left:60pt;margin-top:1pt;'
+                f'width:108pt;height:60pt;z-index:{i};visibility:hidden"'
+                f' fillcolor="#ffffe1" o:insetmode="auto">'
+                f'<v:fill color2="#ffffe1"/>'
+                f'<v:shadow on="t" color="black" obscured="t"/>'
+                f'<v:path o:connecttype="none"/>'
+                f'<v:textbox style="mso-direction-alt:auto">'
+                f'<div style="text-align:left"></div></v:textbox>'
+                f'<x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/>'
+                f'<x:Anchor>{col + 1},15,{row},2,{col + 3},15,{row + 3},16</x:Anchor>'
+                f'<x:AutoFill>False</x:AutoFill><x:Row>{row}</x:Row>'
+                f'<x:Column>{col}</x:Column></x:ClientData></v:shape>')
+        return (
+            '<xml xmlns:v="urn:schemas-microsoft-com:vml"'
+            ' xmlns:o="urn:schemas-microsoft-com:office:office"'
+            ' xmlns:x="urn:schemas-microsoft-com:office:excel">'
+            '<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>'
+            '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202"'
+            ' path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/>'
+            '<v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>'
+            + ''.join(shapes) + '</xml>').encode('utf-8')
 
     def _remove_defined_name(self, name, sheet_name):
         """Drop a sheet-scoped defined name if it already exists."""
@@ -2058,6 +2239,10 @@ class XLSXPackage:
                 for name in self.trees:
                     if name not in written and name not in dropped:
                         zout.writestr(name, self._serialize_tree(name))
+                # New binary/opaque parts (images, VML drawings).
+                for name, data in self._added_bytes.items():
+                    if name not in written and name not in dropped:
+                        zout.writestr(name, data)
 
     def _serialize_tree(self, name):
         """Serialize a cached tree with the standard XML declaration."""

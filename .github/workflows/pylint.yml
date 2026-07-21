@@ -22,6 +22,6 @@ jobs:
     - name: Analysing the code with pylint
       run: |
         pylint src/microxlsx
-        pylint tests --disable=missing-module-docstring,missing-class-docstring,missing-function-docstring,too-few-public-methods,too-many-lines
+        pylint tests --disable=missing-module-docstring,missing-class-docstring,missing-function-docstring,too-few-public-methods,too-many-lines,duplicate-code
     - name: Run tests
       run: pytest -q

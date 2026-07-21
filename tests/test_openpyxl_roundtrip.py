@@ -6,6 +6,8 @@ modified with microxlsx, then reopened with openpyxl to confirm the result is
 still a valid workbook and the change took effect.
 """
 import datetime
+import struct
+import zlib
 
 import openpyxl
 from openpyxl.worksheet.table import Table
@@ -271,3 +273,52 @@ class TestTier2RoundTrips:
         wb = _apply(tmp_path, lambda p: p.add_table(
             "Data", "Extra", "A1:B3", ["x", "y"]))
         assert dict(wb["Data"].tables)["Extra"].autoFilter.ref == "A1:B3"
+
+
+def _tiny_png():
+    width, height = 4, 2
+    raw = b''.join(b'\x00' + b'\x00\x80\xff' * width for _ in range(height))
+
+    def chunk(tag, data):
+        return (struct.pack('>I', len(data)) + tag + data
+                + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
+class TestTier3RoundTrips:
+    def test_hyperlink(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_hyperlink(
+            "Sheet1", "A1", "https://example.com", tooltip="Go"))
+        link = wb["Sheet1"]["A1"].hyperlink
+        assert link.target == "https://example.com"
+        assert link.tooltip == "Go"
+
+    def test_image(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_image("Sheet1", "B2", _tiny_png()))
+        images = wb["Sheet1"]._images  # pylint: disable=protected-access
+        assert len(images) == 1
+        assert images[0].anchor._from.col == 1  # pylint: disable=protected-access
+
+    def test_comment(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_comment(
+            "Sheet1", "A1", "Nice cell", author="Alice"))
+        assert wb["Sheet1"]["A1"].comment.text == "Nice cell"
+        assert wb["Sheet1"]["A1"].comment.author == "Alice"
+
+    def test_multiple_comments(self, tmp_path):
+        def op(pkg):
+            pkg.add_comment("Sheet1", "A1", "one", author="A")
+            pkg.add_comment("Sheet1", "C3", "two", author="B")
+        wb = _apply(tmp_path, op)
+        assert wb["Sheet1"]["A1"].comment.text == "one"
+        assert wb["Sheet1"]["C3"].comment.text == "two"
+
+    def test_image_and_comment_together(self, tmp_path):
+        def op(pkg):
+            pkg.add_image("Sheet1", "D4", _tiny_png())
+            pkg.add_comment("Sheet1", "A1", "note", author="A")
+        wb = _apply(tmp_path, op)
+        assert len(wb["Sheet1"]._images) == 1  # pylint: disable=protected-access
+        assert wb["Sheet1"]["A1"].comment.text == "note"
