@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Package-absolute relationship targets (`Target="/xl/worksheets/sheet1.xml"`,
+  as written by Excel and openpyxl) are now resolved correctly. Previously they
+  produced a malformed `xl//xl/...` path, so microxlsx could not open workbooks
+  authored by those tools at all — only files with relative targets. Table and
+  worksheet-rels paths are resolved the same way (handling `..` and the owning
+  part's directory).
+
 ### Added
 
+- Test suite validates output against **openpyxl**, an independent reader:
+  baselines authored by openpyxl are modified with microxlsx and reopened with
+  openpyxl to confirm the workbook stays valid and each change took effect. CI
+  now runs the test suite (previously it only linted).
 - `insert_rows` / `delete_rows` / `insert_cols` / `delete_cols` — structural
   edits mid-sheet. Cell data, row heights, column widths, merges,
   conditional-formatting and data-validation regions, formulas, and named

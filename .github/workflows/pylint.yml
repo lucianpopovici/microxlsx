@@ -17,9 +17,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pylint pytest
-        pip install -e .
+        pip install pylint
+        pip install -e ".[test]"
     - name: Analysing the code with pylint
       run: |
         pylint src/microxlsx
         pylint tests --disable=missing-module-docstring,missing-class-docstring,missing-function-docstring,too-few-public-methods,too-many-lines
+    - name: Run tests
+      run: pytest -q
