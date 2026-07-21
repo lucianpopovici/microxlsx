@@ -99,6 +99,25 @@ class XLSXPackage:
                 self.trees[path] = ET.parse(f)
         return self.trees[path]
 
+    @staticmethod
+    def _resolve_rel_target(base_dir, target):
+        """Resolve an OPC relationship ``Target`` to a package part name.
+
+        Handles package-absolute targets (leading ``/``, as written by Excel
+        and openpyxl) and relative targets (``worksheets/x.xml``,
+        ``../tables/y.xml``) resolved against the owning part's directory.
+        """
+        if target.startswith('/'):
+            return target[1:]
+        resolved = []
+        for part in f"{base_dir}/{target}".split('/'):
+            if part == '..':
+                if resolved:
+                    resolved.pop()
+            elif part not in ('', '.'):
+                resolved.append(part)
+        return '/'.join(resolved)
+
     def _map_sheets(self, zin):
         """Map Sheets to paths."""
         wb_tree = self._get_tree(zin, 'xl/workbook.xml')
@@ -108,13 +127,12 @@ class XLSXPackage:
         for rel in rel_tree.getroot():
             rid, target = rel.get('Id'), rel.get('Target')
             if rid in id_to_name:
-                path = f"xl/{target}" if not target.startswith('xl/') else target
-                self.sheet_map[id_to_name[rid]] = path
+                self.sheet_map[id_to_name[rid]] = self._resolve_rel_target('xl', target)
 
     def _map_tables(self, zin):
         """Map Tables to metadata."""
         for sheet_name, sheet_path in self.sheet_map.items():
-            rel_path = f"xl/worksheets/_rels/{sheet_path.rsplit('/', maxsplit=1)[-1]}.rels"
+            rel_path = self._sheet_rels_path(sheet_path)
             try:
                 with zin.open(rel_path) as f:
                     t_rel_tree = ET.parse(f)
@@ -126,7 +144,8 @@ class XLSXPackage:
 
     def _parse_table_rel(self, zin, sheet_name, rel):
         """Helper to parse table relationship."""
-        t_path = f"xl/tables/{rel.get('Target').rsplit('/', maxsplit=1)[-1]}"
+        base = self.sheet_map[sheet_name].rpartition('/')[0]
+        t_path = self._resolve_rel_target(base, rel.get('Target'))
         t_tree = self._get_tree(zin, t_path)
         t_root = t_tree.getroot()
         t_name, t_ref = t_root.get('displayName'), t_root.get('ref')
@@ -338,8 +357,9 @@ class XLSXPackage:
 
     @staticmethod
     def _sheet_rels_path(sheet_path):
-        """Return the .rels path for a worksheet part."""
-        return f"xl/worksheets/_rels/{sheet_path.rsplit('/', maxsplit=1)[-1]}.rels"
+        """Return the .rels path for a worksheet part (from its directory)."""
+        head, _, tail = sheet_path.rpartition('/')
+        return f"{head}/_rels/{tail}.rels" if head else f"_rels/{tail}.rels"
 
     def _next_part_number(self, prefix):
         """Return the next free integer for ``{prefix}N.xml`` part names."""
