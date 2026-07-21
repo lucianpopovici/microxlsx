@@ -2,7 +2,9 @@
 Unit tests for microxlsx.core
 """
 import datetime
+import struct
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 import pytest
 
@@ -10,6 +12,7 @@ from microxlsx.core import XLSXPackage
 
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 # ---------------------------------------------------------------------------
 # Minimal XLSX fixture helpers
@@ -2363,3 +2366,81 @@ class TestProtectSheet:
         pkg.protect_sheet("Sheet1")
         prot = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f"{{{NS}}}sheetProtection")
         assert prot.get("sheet") == "1" and prot.get("password") is None
+
+
+def _tiny_png():
+    width, height = 2, 3
+    raw = b''.join(b'\x00' + b'\xff\x00\x00' * width for _ in range(height))
+
+    def chunk(tag, data):
+        return (struct.pack('>I', len(data)) + tag + data
+                + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff))
+    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
+class TestHyperlink:
+    def test_link_and_relationship(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_hyperlink("Sheet1", "A1", "https://example.com", tooltip="Go")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        link = root.find(f"{{{NS}}}hyperlinks/{{{NS}}}hyperlink")
+        assert link.get("ref") == "A1" and link.get("tooltip") == "Go"
+        rid = link.get(f"{{{NS_R}}}id")
+        rels = pkg.trees["xl/worksheets/_rels/sheet1.xml.rels"].getroot()
+        rel = next(r for r in rels if r.get("Id") == rid)
+        assert rel.get("Target") == "https://example.com"
+        assert rel.get("TargetMode") == "External"
+
+
+class TestImage:
+    def test_parts_created(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_image("Sheet1", "B2", _tiny_png())
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        with zipfile.ZipFile(out, "r") as zf:
+            names = set(zf.namelist())
+            assert "xl/media/image1.png" in names
+            assert "xl/drawings/drawing1.xml" in names
+            assert b"image/png" in zf.read("[Content_Types].xml")
+            assert zf.read("xl/media/image1.png").startswith(b"\x89PNG")
+
+    def test_anchor_uses_cell_position(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_image("Sheet1", "B2", _tiny_png())
+        xdr = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+        root = pkg.trees["xl/drawings/drawing1.xml"].getroot()
+        frm = root.find(f".//{{{xdr}}}from")
+        assert frm.find(f"{{{xdr}}}col").text == "1"  # B
+        assert frm.find(f"{{{xdr}}}row").text == "1"  # 2
+
+    def test_png_size_detected(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        assert pkg._png_size(_tiny_png()) == (2, 3)  # pylint: disable=protected-access
+
+
+class TestComment:
+    def test_comment_parts_and_content(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_comment("Sheet1", "A1", "Note text", author="Bob")
+        comments = pkg.trees["xl/comments1.xml"].getroot()
+        assert comments.find(f".//{{{NS}}}author").text == "Bob"
+        comment = comments.find(f".//{{{NS}}}comment")
+        assert comment.get("ref") == "A1"
+        assert comment.find(f".//{{{NS}}}t").text == "Note text"
+
+    def test_vml_and_legacy_drawing_wired(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_comment("Sheet1", "A1", "x", author="A")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f"{{{NS}}}legacyDrawing") is not None
+        assert "xl/drawings/vmlDrawing1.vml" in pkg._added_bytes  # pylint: disable=protected-access
+
+    def test_two_authors_deduped(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_comment("Sheet1", "A1", "one", author="A")
+        pkg.add_comment("Sheet1", "B2", "two", author="A")
+        authors = pkg.trees["xl/comments1.xml"].getroot().find(f"{{{NS}}}authors")
+        assert len(authors) == 1  # same author reused
