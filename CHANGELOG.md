@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `freeze_panes(sheet, cell)` — freeze rows above / columns left of a cell.
+- `rename_sheet(old, new)` — rename a sheet and rewrite `OldName!` /
+  `'Old Name'!` qualifiers across every sheet's formulas and the workbook's
+  defined names (quoting the new name when needed).
+- `add_defined_name(name, ref, sheet_name=None)` — create a workbook-global or
+  sheet-scoped defined name.
+- `add_table` applies a banded built-in table style by default
+  (`style_name="TableStyleMedium2"`, `None` to omit).
 - Test suite validates output against **openpyxl**, an independent reader:
   baselines authored by openpyxl are modified with microxlsx and reopened with
   openpyxl to confirm the workbook stays valid and each change took effect. CI

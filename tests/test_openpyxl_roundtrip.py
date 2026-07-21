@@ -198,3 +198,45 @@ class TestChainedOperations:
         assert report["A1"].font.bold is True
         assert report["C2"].value == datetime.datetime(2026, 1, 31)
         assert "Totals" in dict(report.tables)
+
+
+class TestFinishingTouchesRoundTrips:
+    def test_freeze_panes(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.freeze_panes("Sheet1", "B2"))
+        assert wb["Sheet1"].freeze_panes == "B2"
+
+    def test_rename_sheet_updates_cross_sheet_formula(self, tmp_path):
+        # Data!A1 references Sheet1; renaming Sheet1 must fix that qualifier.
+        def build(path):
+            wb = openpyxl.Workbook()
+            wb.active.title = "Sheet1"
+            wb.active["B2"] = 10
+            wb.create_sheet("Data")["A1"] = "=Sheet1!B2*2"
+            wb.save(path)
+            return path
+        src = build(str(tmp_path / "in.xlsx"))
+        pkg = XLSXPackage(src)
+        pkg.rename_sheet("Sheet1", "Sales")
+        out = str(tmp_path / "out.xlsx")
+        pkg.save(out)
+        wb = openpyxl.load_workbook(out)
+        assert wb.sheetnames == ["Sales", "Data"]
+        assert wb["Data"]["A1"].value == "=Sales!B2*2"
+
+    def test_add_defined_name(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_defined_name(
+            "TaxRate", "Sheet1!$B$2"))
+        assert "TaxRate" in wb.defined_names
+        assert wb.defined_names["TaxRate"].value == "Sheet1!$B$2"
+
+    def test_add_scoped_defined_name(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_defined_name(
+            "Local", "Sheet1!$A$1", sheet_name="Sheet1"))
+        assert "Local" in wb["Sheet1"].defined_names
+
+    def test_table_style_reads_back(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_table(
+            "Data", "Extra", "A1:B3", ["x", "y"]))
+        table = dict(wb["Data"].tables)["Extra"]
+        assert table.tableStyleInfo.name == "TableStyleMedium2"
+        assert table.tableStyleInfo.showRowStripes is True
