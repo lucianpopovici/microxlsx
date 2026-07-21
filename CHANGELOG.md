@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `set_auto_filter(sheet, ref)` adds worksheet filter dropdowns; new tables
+  from `add_table` include an autoFilter by default, kept in sync with the
+  table's `ref` through resize / move / insert / delete.
+- Page setup: `set_page_setup(sheet, orientation=, fit_to_width=, fit_to_height=)`,
+  `set_print_area(sheet, ref)` (an `_xlnm.Print_Area` defined name), and
+  `set_header_footer(sheet, header=, footer=)`.
+- `protect_sheet(sheet, password=None)` enables worksheet protection using
+  Excel's legacy 16-bit password hash.
 - `freeze_panes(sheet, cell)` — freeze rows above / columns left of a cell.
 - `rename_sheet(old, new)` — rename a sheet and rewrite `OldName!` /
   `'Old Name'!` qualifiers across every sheet's formulas and the workbook's
