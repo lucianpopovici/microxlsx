@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-21
+
 ### Fixed
 
 - Package-absolute relationship targets (`Target="/xl/worksheets/sheet1.xml"`,
@@ -160,5 +162,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table's range), `merge_cells`, and `save`.
 - Sheet and table relationship mapping, and cell-reference conversion helpers.
 
-[Unreleased]: https://github.com/lucianpopovici/microxlsx/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lucianpopovici/microxlsx/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lucianpopovici/microxlsx/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lucianpopovici/microxlsx/releases/tag/v0.1.0
