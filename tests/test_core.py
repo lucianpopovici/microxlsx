@@ -2444,3 +2444,203 @@ class TestComment:
         pkg.add_comment("Sheet1", "B2", "two", author="A")
         authors = pkg.trees["xl/comments1.xml"].getroot().find(f"{{{NS}}}authors")
         assert len(authors) == 1  # same author reused
+
+
+class TestDataValidation:
+    def _dv(self, pkg):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        return root.find(f"{{{NS}}}dataValidations")
+
+    def test_list_validation(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_data_validation("Sheet1", "B1:B5", "list",
+                                formula1='"Yes,No"', prompt="Pick",
+                                prompt_title="Choose")
+        dvs = self._dv(pkg)
+        assert dvs.get("count") == "1"
+        dv = dvs.find(f"{{{NS}}}dataValidation")
+        assert dv.get("type") == "list"
+        assert dv.get("sqref") == "B1:B5"
+        assert dv.get("allowBlank") == "1"
+        assert dv.get("showInputMessage") == "1"
+        assert dv.find(f"{{{NS}}}formula1").text == '"Yes,No"'
+
+    def test_bounded_validation_with_two_formulas(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_data_validation("Sheet1", "C1:C9", "whole", operator="between",
+                                formula1="1", formula2="10", error="nope",
+                                error_title="Bad", allow_blank=False)
+        dv = self._dv(pkg).find(f"{{{NS}}}dataValidation")
+        assert dv.get("operator") == "between"
+        assert dv.get("allowBlank") == "0"
+        assert dv.get("showErrorMessage") == "1"
+        assert dv.find(f"{{{NS}}}formula1").text == "1"
+        assert dv.find(f"{{{NS}}}formula2").text == "10"
+
+    def test_hidden_dropdown_flag(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_data_validation("Sheet1", "B1", "list", formula1='"a,b"',
+                                show_dropdown=False)
+        dv = self._dv(pkg).find(f"{{{NS}}}dataValidation")
+        assert dv.get("showDropDown") == "1"  # OOXML: "1" hides the dropdown
+
+    def test_count_tracks_multiple(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_data_validation("Sheet1", "A1", "list", formula1='"a"')
+        pkg.add_data_validation("Sheet1", "A2", "list", formula1='"b"')
+        assert self._dv(pkg).get("count") == "2"
+
+
+class TestConditionalFormatting:
+    def _cfs(self, pkg):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        return root.findall(f"{{{NS}}}conditionalFormatting")
+
+    def test_cellis_rule(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        dxf = pkg.add_dxf(fill_color="FFC7CE")
+        pkg.add_conditional_format("Sheet1", "A1:A9", "cellIs",
+                                   operator="greaterThan", formula="5", dxf=dxf)
+        cf = self._cfs(pkg)[0]
+        assert cf.get("sqref") == "A1:A9"
+        rule = cf.find(f"{{{NS}}}cfRule")
+        assert rule.get("type") == "cellIs"
+        assert rule.get("operator") == "greaterThan"
+        assert rule.get("dxfId") == "0"
+        assert rule.get("priority") == "1"
+        assert rule.find(f"{{{NS}}}formula").text == "5"
+
+    def test_color_scale_three_stops(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_conditional_format("Sheet1", "A1:A9", "colorScale",
+                                   colors=["FFF8696B", "FFFCFCFF", "FF63BE7B"])
+        scale = self._cfs(pkg)[0].find(f"{{{NS}}}cfRule/{{{NS}}}colorScale")
+        assert len(scale.findall(f"{{{NS}}}cfvo")) == 3
+        assert len(scale.findall(f"{{{NS}}}color")) == 3
+
+    def test_data_bar(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_conditional_format("Sheet1", "A1:A9", "dataBar", color="638EC6")
+        data_bar = self._cfs(pkg)[0].find(f"{{{NS}}}cfRule/{{{NS}}}dataBar")
+        assert data_bar.find(f"{{{NS}}}color").get("rgb") == "FF638EC6"
+
+    def test_priorities_increment(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_conditional_format("Sheet1", "A1:A9", "dataBar")
+        pkg.add_conditional_format("Sheet1", "B1:B9", "dataBar")
+        prios = [cf.find(f"{{{NS}}}cfRule").get("priority") for cf in self._cfs(pkg)]
+        assert prios == ["1", "2"]
+
+    def test_unknown_rule_raises(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.add_conditional_format("Sheet1", "A1", "bogus")
+
+    def test_dxf_bgcolor_and_ordering(self, tmp_path):
+        pkg = XLSXPackage(make_styles_xlsx(tmp_path))
+        pkg.add_dxf(fill_color="FFC7CE", font_color="9C0006", bold=True)
+        root = pkg.trees["xl/styles.xml"].getroot()
+        dxfs = root.find(f"{{{NS}}}dxfs")
+        assert dxfs.get("count") == "1"
+        pattern = dxfs.find(f"{{{NS}}}dxf/{{{NS}}}fill/{{{NS}}}patternFill")
+        assert pattern.find(f"{{{NS}}}bgColor").get("rgb") == "FFFFC7CE"
+        # dxfs must sit after cellXfs in the styleSheet child order.
+        tags = [c.tag.split("}")[-1] for c in root]
+        assert tags.index("dxfs") > tags.index("cellXfs")
+
+
+class TestHideAndGroup:
+    def _root(self, pkg):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+
+    def test_hide_rows(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.hide_rows("Sheet1", 2, 3)
+        rows = {r.get("r"): r for r in self._root(pkg).iter(f"{{{NS}}}row")}
+        assert rows["2"].get("hidden") == "1"
+        assert rows["3"].get("hidden") == "1"
+
+    def test_hide_columns(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.hide_columns("Sheet1", "B", "C")
+        cols = self._root(pkg).find(f"{{{NS}}}cols")
+        hidden = {c.get("min") for c in cols if c.get("hidden") == "1"}
+        assert hidden == {"2", "3"}
+
+    def test_group_rows_sets_outline(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.group_rows("Sheet1", 2, 4, collapsed=True)
+        rows = {r.get("r"): r for r in self._root(pkg).iter(f"{{{NS}}}row")}
+        assert rows["2"].get("outlineLevel") == "1"
+        assert rows["2"].get("hidden") == "1"
+        assert rows["5"].get("collapsed") == "1"  # summary row below the group
+
+    def test_group_columns_sets_outline(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.group_columns("Sheet1", "B", "C")
+        cols = {c.get("min"): c for c in self._root(pkg).find(f"{{{NS}}}cols")}
+        assert cols["2"].get("outlineLevel") == "1"
+
+
+class TestSheetVisibilityAndTabColor:
+    def test_tab_color_first_in_sheetpr(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_page_setup("Sheet1", fit_to_width=1)  # creates pageSetUpPr first
+        pkg.set_tab_color("Sheet1", "FF0000")
+        sheet_pr = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f"{{{NS}}}sheetPr")
+        assert sheet_pr[0].tag.split("}")[-1] == "tabColor"
+        assert sheet_pr[0].get("rgb") == "FFFF0000"
+
+    def test_hide_sheet(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_sheet("Second")
+        pkg.set_sheet_visibility("Sheet1", "veryHidden")
+        sheets = pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}sheets")
+        target = next(s for s in sheets if s.get("name") == "Sheet1")
+        assert target.get("state") == "veryHidden"
+
+    def test_cannot_hide_only_visible_sheet(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.set_sheet_visibility("Sheet1", "hidden")
+
+    def test_invalid_state_raises(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        with pytest.raises(ValueError):
+            pkg.set_sheet_visibility("Sheet1", "sometimes")
+
+
+class TestRemovals:
+    def test_remove_hyperlink(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_hyperlink("Sheet1", "A1", "https://example.com")
+        pkg.remove_hyperlink("Sheet1", "A1")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f"{{{NS}}}hyperlinks") is None
+        rels = pkg.trees["xl/worksheets/_rels/sheet1.xml.rels"].getroot()
+        assert len(rels.findall(f"{{{NS_REL}}}Relationship")) == 0
+
+    def test_remove_comment_keeps_others(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_comment("Sheet1", "A1", "gone", author="A")
+        pkg.add_comment("Sheet1", "C3", "stays", author="A")
+        pkg.remove_comment("Sheet1", "A1")
+        clist = pkg.trees["xl/comments1.xml"].getroot().find(f"{{{NS}}}commentList")
+        refs = [c.get("ref") for c in clist]
+        assert refs == ["C3"]
+
+    def test_remove_defined_name_global(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_defined_name("Keep", "Sheet1!$A$1")
+        pkg.add_defined_name("Drop", "Sheet1!$B$1")
+        assert pkg.remove_defined_name("Drop") == 1
+        names = pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}definedNames")
+        assert [n.get("name") for n in names] == ["Keep"]
+
+    def test_remove_defined_name_scoped(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_defined_name("Scoped", "Sheet1!$A$1", sheet_name="Sheet1")
+        assert pkg.remove_defined_name("Scoped", sheet_name="Sheet1") == 1
+        # container is dropped once empty
+        assert (pkg.trees["xl/workbook.xml"].getroot()
+                .find(f"{{{NS}}}definedNames") is None)

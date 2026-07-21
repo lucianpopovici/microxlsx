@@ -322,3 +322,124 @@ class TestTier3RoundTrips:
         wb = _apply(tmp_path, op)
         assert len(wb["Sheet1"]._images) == 1  # pylint: disable=protected-access
         assert wb["Sheet1"]["A1"].comment.text == "note"
+
+
+class TestTier4RoundTrips:
+    def test_list_validation(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_data_validation(
+            "Sheet1", "C1:C5", "list", formula1='"Yes,No,Maybe"',
+            prompt="Pick", prompt_title="Choose"))
+        dvs = list(wb["Sheet1"].data_validations.dataValidation)
+        assert len(dvs) == 1
+        assert dvs[0].type == "list"
+        assert dvs[0].formula1 == '"Yes,No,Maybe"'
+        assert str(dvs[0].sqref) == "C1:C5"
+        assert dvs[0].promptTitle == "Choose"
+
+    def test_whole_between_validation(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_data_validation(
+            "Sheet1", "C1:C5", "whole", operator="between",
+            formula1="1", formula2="100", error="1-100", error_title="Bad"))
+        dv = list(wb["Sheet1"].data_validations.dataValidation)[0]
+        assert dv.type == "whole"
+        assert dv.operator == "between"
+        assert dv.formula1 == "1"
+        assert dv.formula2 == "100"
+        assert dv.errorTitle == "Bad"
+
+    def test_two_validations(self, tmp_path):
+        def op(pkg):
+            pkg.add_data_validation("Sheet1", "C1:C5", "list",
+                                    formula1='"a,b"')
+            pkg.add_data_validation("Sheet1", "D1:D5", "decimal",
+                                    operator="greaterThan", formula1="0")
+        wb = _apply(tmp_path, op)
+        assert len(list(wb["Sheet1"].data_validations.dataValidation)) == 2
+
+    def test_cellis_rule_with_dxf(self, tmp_path):
+        def op(pkg):
+            style = pkg.add_dxf(fill_color="FFC7CE", font_color="9C0006")
+            pkg.add_conditional_format("Sheet1", "B2:B3", "cellIs",
+                                       operator="greaterThan", formula="15",
+                                       dxf=style)
+        wb = _apply(tmp_path, op)
+        rules = wb["Sheet1"].conditional_formatting["B2:B3"]
+        assert rules[0].type == "cellIs"
+        assert rules[0].operator == "greaterThan"
+        assert rules[0].dxfId == 0
+
+    def test_color_scale_rule(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_conditional_format(
+            "Sheet1", "B2:B3", "colorScale",
+            colors=["FFF8696B", "FFFCFCFF", "FF63BE7B"]))
+        rule = wb["Sheet1"].conditional_formatting["B2:B3"][0]
+        assert rule.type == "colorScale"
+        assert len(rule.colorScale.color) == 3
+
+    def test_data_bar_rule(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_conditional_format(
+            "Sheet1", "B2:B3", "dataBar", color="638EC6"))
+        rule = wb["Sheet1"].conditional_formatting["B2:B3"][0]
+        assert rule.type == "dataBar"
+
+    def test_multiple_rules_get_priorities(self, tmp_path):
+        def op(pkg):
+            pkg.add_conditional_format("Sheet1", "B2:B3", "dataBar")
+            pkg.add_conditional_format("Sheet1", "B2:B3", "colorScale")
+        wb = _apply(tmp_path, op)
+        rules = wb["Sheet1"].conditional_formatting["B2:B3"]
+        assert sorted(r.priority for r in rules) == [1, 2]
+
+
+class TestTier5RoundTrips:
+    def test_hide_rows(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.hide_rows("Sheet1", 2, 3))
+        assert wb["Sheet1"].row_dimensions[2].hidden is True
+        assert wb["Sheet1"].row_dimensions[3].hidden is True
+
+    def test_hide_columns(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.hide_columns("Sheet1", "B"))
+        assert wb["Sheet1"].column_dimensions["B"].hidden is True
+
+    def test_group_rows(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.group_rows(
+            "Sheet1", 2, 3, collapsed=True))
+        assert wb["Sheet1"].row_dimensions[2].outlineLevel == 1
+        assert wb["Sheet1"].row_dimensions[2].hidden is True
+
+    def test_group_columns(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.group_columns("Sheet1", "B", "C"))
+        assert wb["Sheet1"].column_dimensions["B"].outlineLevel == 1
+
+    def test_tab_color(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_tab_color("Sheet1", "FF0000"))
+        assert wb["Sheet1"].sheet_properties.tabColor.rgb == "FFFF0000"
+
+    def test_sheet_visibility(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_sheet_visibility("Data", "hidden"))
+        assert wb["Data"].sheet_state == "hidden"
+
+    def test_remove_hyperlink(self, tmp_path):
+        def op(pkg):
+            pkg.add_hyperlink("Sheet1", "A1", "https://example.com")
+            pkg.remove_hyperlink("Sheet1", "A1")
+        wb = _apply(tmp_path, op)
+        assert wb["Sheet1"]["A1"].hyperlink is None
+
+    def test_remove_comment(self, tmp_path):
+        def op(pkg):
+            pkg.add_comment("Sheet1", "A1", "gone", author="A")
+            pkg.add_comment("Sheet1", "C3", "stays", author="A")
+            pkg.remove_comment("Sheet1", "A1")
+        wb = _apply(tmp_path, op)
+        assert wb["Sheet1"]["A1"].comment is None
+        assert wb["Sheet1"]["C3"].comment.text == "stays"
+
+    def test_remove_defined_name(self, tmp_path):
+        def op(pkg):
+            pkg.add_defined_name("Keep", "Sheet1!$A$1")
+            pkg.add_defined_name("Drop", "Sheet1!$B$1")
+            assert pkg.remove_defined_name("Drop") == 1
+        wb = _apply(tmp_path, op)
+        assert "Keep" in wb.defined_names
+        assert "Drop" not in wb.defined_names

@@ -83,6 +83,21 @@ pkg.freeze_panes("Sheet1", "B2")                 # freeze header row + first col
 pkg.rename_sheet("Sheet1", "Summary")            # rewrites Sheet1! qualifiers
 pkg.add_defined_name("TaxRate", "Summary!$B$2")  # workbook-global named range
 
+# Data validation & conditional formatting (author, don't just shift)
+pkg.add_data_validation("Summary", "C2:C99", "list", formula1='"Low,Med,High"')
+pkg.add_data_validation("Summary", "D2:D99", "whole",
+                        operator="between", formula1="0", formula2="100")
+warn = pkg.add_dxf(fill_color="FFC7CE", font_color="9C0006")
+pkg.add_conditional_format("Summary", "B2:B99", "cellIs",
+                           operator="lessThan", formula="0", dxf=warn)
+pkg.add_conditional_format("Summary", "B2:B99", "dataBar", color="638EC6")
+
+# Outline, hide, tab color, sheet visibility
+pkg.group_rows("Summary", 3, 8, collapsed=True)
+pkg.hide_columns("Summary", "F", "H")
+pkg.set_tab_color("Summary", "1F7A3D")
+pkg.set_sheet_visibility("Scratch", "hidden")
+
 # Reuse or inspect existing styles
 tmpl = pkg.get_cell_style("Sheet1", "B2")            # raw id, always faithful
 pkg.update_cell("Sheet1", "B10", value=99, style_id=tmpl)
