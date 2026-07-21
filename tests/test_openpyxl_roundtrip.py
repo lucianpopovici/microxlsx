@@ -240,3 +240,34 @@ class TestFinishingTouchesRoundTrips:
         table = dict(wb["Data"].tables)["Extra"]
         assert table.tableStyleInfo.name == "TableStyleMedium2"
         assert table.tableStyleInfo.showRowStripes is True
+
+
+class TestTier2RoundTrips:
+    def test_worksheet_auto_filter(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_auto_filter("Sheet1", "A1:B3"))
+        assert wb["Sheet1"].auto_filter.ref == "A1:B3"
+
+    def test_page_setup(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_page_setup(
+            "Sheet1", orientation="landscape", fit_to_width=1))
+        assert wb["Sheet1"].page_setup.orientation == "landscape"
+        assert wb["Sheet1"].sheet_properties.pageSetUpPr.fitToPage is True
+
+    def test_print_area(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_print_area("Sheet1", "$A$1:$B$3"))
+        assert wb["Sheet1"].print_area == "'Sheet1'!$A$1:$B$3"
+
+    def test_header_footer(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.set_header_footer(
+            "Sheet1", header="&CQuarterly", footer="&CPage &P of &N"))
+        assert wb["Sheet1"].oddHeader.center.text == "Quarterly"
+
+    def test_protect_sheet(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.protect_sheet("Sheet1", password="secret"))
+        assert wb["Sheet1"].protection.sheet is True
+        assert wb["Sheet1"].protection.password == "DAA7"
+
+    def test_table_autofilter_present(self, tmp_path):
+        wb = _apply(tmp_path, lambda p: p.add_table(
+            "Data", "Extra", "A1:B3", ["x", "y"]))
+        assert dict(wb["Data"].tables)["Extra"].autoFilter.ref == "A1:B3"

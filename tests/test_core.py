@@ -2273,3 +2273,93 @@ class TestAddTableStyle:
         pkg.add_table("Sheet1", "T", "D1:E2", ["x", "y"], style_name=None)
         root = pkg.trees["xl/tables/table2.xml"].getroot()
         assert root.find(f"{{{NS}}}tableStyleInfo") is None
+
+
+class TestAutoFilter:
+    def test_worksheet_auto_filter(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_auto_filter("Sheet1", "A1:C1")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        assert root.find(f"{{{NS}}}autoFilter").get("ref") == "A1:C1"
+
+    def test_autofilter_ordered_before_mergecells(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.merge_cells("Sheet1", "A1:B1")
+        pkg.set_auto_filter("Sheet1", "A1:C1")
+        tags = [c.tag.split("}")[-1]
+                for c in pkg.trees[pkg.sheet_map["Sheet1"]].getroot()]
+        assert tags.index("autoFilter") < tags.index("mergeCells")
+
+    def test_new_table_has_autofilter(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T", "D1:E3", ["x", "y"])
+        root = pkg.trees["xl/tables/table2.xml"].getroot()
+        assert root.find(f"{{{NS}}}autoFilter").get("ref") == "D1:E3"
+
+    def test_table_autofilter_follows_resize(self, tmp_path):
+        # A table created via add_table has an autoFilter; resizing keeps it synced.
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T", "D1:E3", ["x", "y"])
+        pkg.resize_table("T", add_rows=2)
+        root = pkg.trees[pkg.table_map["T"]["xml_path"]].getroot()
+        assert root.get("ref") == "D1:E5"
+        assert root.find(f"{{{NS}}}autoFilter").get("ref") == "D1:E5"
+
+
+class TestPageSetup:
+    def _root(self, pkg):
+        return pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+
+    def test_orientation(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_page_setup("Sheet1", orientation="landscape")
+        assert self._root(pkg).find(f"{{{NS}}}pageSetup").get("orientation") == "landscape"
+
+    def test_fit_to_page(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_page_setup("Sheet1", fit_to_width=1, fit_to_height=0)
+        root = self._root(pkg)
+        assert root.find(f"{{{NS}}}pageSetup").get("fitToWidth") == "1"
+        page_pr = root.find(f"{{{NS}}}sheetPr/{{{NS}}}pageSetUpPr")
+        assert page_pr.get("fitToPage") == "1"
+
+    def test_print_area_defined_name(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_print_area("Sheet1", "$A$1:$C$10")
+        names = {n.get("name"): n
+                 for n in pkg.trees["xl/workbook.xml"].getroot()
+                 .find(f"{{{NS}}}definedNames")}
+        entry = names["_xlnm.Print_Area"]
+        assert entry.get("localSheetId") == "0"
+        assert entry.text == "Sheet1!$A$1:$C$10"
+
+    def test_print_area_replaces_existing(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_print_area("Sheet1", "A1:B2")
+        pkg.set_print_area("Sheet1", "A1:C3")
+        entries = [n for n in pkg.trees["xl/workbook.xml"].getroot()
+                   .find(f"{{{NS}}}definedNames")
+                   if n.get("name") == "_xlnm.Print_Area"]
+        assert len(entries) == 1 and entries[0].text.endswith("A1:C3")
+
+    def test_header_footer(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_header_footer("Sheet1", header="&CTitle", footer="&CPage &P")
+        hf = self._root(pkg).find(f"{{{NS}}}headerFooter")
+        assert hf.find(f"{{{NS}}}oddHeader").text == "&CTitle"
+        assert hf.find(f"{{{NS}}}oddFooter").text == "&CPage &P"
+
+
+class TestProtectSheet:
+    def test_protection_enabled_with_password(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.protect_sheet("Sheet1", password="secret")
+        prot = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f"{{{NS}}}sheetProtection")
+        assert prot.get("sheet") == "1"
+        assert prot.get("password") == "DAA7"  # Excel legacy hash of "secret"
+
+    def test_protection_without_password(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.protect_sheet("Sheet1")
+        prot = pkg.trees[pkg.sheet_map["Sheet1"]].getroot().find(f"{{{NS}}}sheetProtection")
+        assert prot.get("sheet") == "1" and prot.get("password") is None

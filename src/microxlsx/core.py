@@ -14,6 +14,19 @@ _EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
 # Mac-origin workbooks (workbookPr date1904="1") count days from 1904 instead.
 _EXCEL_EPOCH_1904 = datetime.datetime(1904, 1, 1)
 
+# Child element order of a <worksheet> (ECMA-376 §18.3.1.99), for inserting
+# new children in a schema-valid position.
+_WS_ORDER = (
+    'sheetPr', 'dimension', 'sheetViews', 'sheetFormatPr', 'cols', 'sheetData',
+    'sheetCalcPr', 'sheetProtection', 'protectedRanges', 'scenarios',
+    'autoFilter', 'sortState', 'dataConsolidate', 'customSheetViews',
+    'mergeCells', 'phoneticPr', 'conditionalFormatting', 'dataValidations',
+    'hyperlinks', 'printOptions', 'pageMargins', 'pageSetup', 'headerFooter',
+    'rowBreaks', 'colBreaks', 'customProperties', 'cellWatches',
+    'ignoredErrors', 'smartTags', 'drawing', 'drawingHF', 'picture',
+    'oleObjects', 'controls', 'webPublishItems', 'tableParts', 'extLst',
+)
+
 # Built-in number-format ids that render as dates/times (ECMA-376 §18.8.30).
 _BUILTIN_DATE_FMTS = frozenset(
     list(range(14, 23)) + list(range(27, 37)) + list(range(45, 48))
@@ -306,6 +319,7 @@ class XLSXPackage:
         self.trees[part] = ET.ElementTree(ET.fromstring(
             f'<table xmlns="{ns}" id="{self._next_table_id()}" name="{name}"'
             f' displayName="{name}" ref="{ref}">'
+            f'<autoFilter ref="{ref}"/>'
             f'<tableColumns count="{len(columns)}">{cols}</tableColumns>'
             f'{style}</table>'))
         rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[sheet_name]))
@@ -601,8 +615,33 @@ class XLSXPackage:
         top, left, bottom, right = box
         meta['start_indices'] = (top, left)
         meta['range'] = [indices_to_cell(top, left), indices_to_cell(bottom, right)]
-        self.trees[meta['xml_path']].getroot().set(
-            'ref', f"{meta['range'][0]}:{meta['range'][1]}")
+        self._write_table_ref(meta)
+
+    def _write_table_ref(self, table):
+        """Write a table's ``ref`` (and keep any autoFilter ref in sync)."""
+        ns = self.NS['main']
+        ref = f"{table['range'][0]}:{table['range'][1]}"
+        root = self.trees[table['xml_path']].getroot()
+        root.set('ref', ref)
+        auto = root.find(f"{{{ns}}}autoFilter")
+        if auto is not None:
+            auto.set('ref', ref)
+
+    def _ws_ordered_child(self, root, tag):
+        """Find or create a worksheet child ``tag`` in schema-valid order."""
+        ns = self.NS['main']
+        existing = root.find(f"{{{ns}}}{tag}")
+        if existing is not None:
+            return existing
+        element = ET.Element(f"{{{ns}}}{tag}")
+        following = set(_WS_ORDER[_WS_ORDER.index(tag) + 1:])
+        idx = len(root)
+        for i, child in enumerate(root):
+            if child.tag.rsplit('}', maxsplit=1)[-1] in following:
+                idx = i
+                break
+        root.insert(idx, element)
+        return element
 
     def _shift_cells_from(self, root, pos, count, axis):
         """Physically shift all cells at/after ``pos`` along ``axis``."""
@@ -822,6 +861,84 @@ class XLSXPackage:
                  'bottomLeft' if row else 'topRight')
         pane.set('state', 'frozen')
         view.insert(0, pane)  # pane must precede any selection
+
+    def set_auto_filter(self, sheet_name, ref):
+        """Add filter dropdowns over ``ref`` (worksheet-level autoFilter)."""
+        root = self._sheet_root(sheet_name)
+        self._ws_ordered_child(root, 'autoFilter').set('ref', ref)
+
+    def set_page_setup(self, sheet_name, *, orientation=None,
+                       fit_to_width=None, fit_to_height=None):
+        """Set page orientation and fit-to-page for printing."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        setup = self._ws_ordered_child(root, 'pageSetup')
+        if orientation is not None:
+            setup.set('orientation', orientation)
+        if fit_to_width is not None:
+            setup.set('fitToWidth', str(fit_to_width))
+        if fit_to_height is not None:
+            setup.set('fitToHeight', str(fit_to_height))
+        if fit_to_width is not None or fit_to_height is not None:
+            sheet_pr = self._ws_ordered_child(root, 'sheetPr')
+            page_pr = sheet_pr.find(f"{{{ns}}}pageSetUpPr")
+            if page_pr is None:
+                page_pr = ET.SubElement(sheet_pr, f"{{{ns}}}pageSetUpPr")
+            page_pr.set('fitToPage', '1')
+
+    def set_print_area(self, sheet_name, ref):
+        """Set the print area for a sheet (an ``_xlnm.Print_Area`` defined name)."""
+        area = ref if '!' in ref else f"{self._quote_sheet_name(sheet_name)}!{ref}"
+        self._remove_defined_name('_xlnm.Print_Area', sheet_name)
+        self.add_defined_name('_xlnm.Print_Area', area, sheet_name=sheet_name)
+
+    def set_header_footer(self, sheet_name, *, header=None, footer=None):
+        """Set the print header and/or footer (use ``&C``, ``&P``, ``&D`` codes)."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        node = self._ws_ordered_child(root, 'headerFooter')
+        for tag, value in (('oddHeader', header), ('oddFooter', footer)):
+            if value is not None:
+                child = node.find(f"{{{ns}}}{tag}")
+                if child is None:
+                    child = ET.SubElement(node, f"{{{ns}}}{tag}")
+                child.text = value
+
+    def protect_sheet(self, sheet_name, *, password=None, allow_select=True):
+        """Enable worksheet protection, optionally with a password."""
+        root = self._sheet_root(sheet_name)
+        prot = self._ws_ordered_child(root, 'sheetProtection')
+        prot.set('sheet', '1')
+        if password is not None:
+            prot.set('password', self._legacy_password_hash(password))
+        if allow_select:
+            prot.set('selectLockedCells', '0')
+            prot.set('selectUnlockedCells', '0')
+
+    def _remove_defined_name(self, name, sheet_name):
+        """Drop a sheet-scoped defined name if it already exists."""
+        ns = self.NS['main']
+        root = self.trees['xl/workbook.xml'].getroot()
+        names = root.find(f"{{{ns}}}definedNames")
+        if names is None:
+            return
+        order = [s.get('name') for s in root.find(f"{{{ns}}}sheets")]
+        local_id = str(order.index(sheet_name))
+        for entry in list(names.findall(f"{{{ns}}}definedName")):
+            if entry.get('name') == name and entry.get('localSheetId') == local_id:
+                names.remove(entry)
+
+    @staticmethod
+    def _legacy_password_hash(password):
+        """Excel's legacy 16-bit worksheet-password hash (4 hex digits)."""
+        value = 0
+        for char in reversed(password):
+            value = ((value >> 14) & 0x01) | ((value << 1) & 0x7FFF)
+            value ^= ord(char)
+        value = ((value >> 14) & 0x01) | ((value << 1) & 0x7FFF)
+        value ^= len(password)
+        value ^= 0xCE4B
+        return f"{value:04X}"
 
     def rename_sheet(self, old_name, new_name):
         """Rename a sheet, rewriting ``OldName!`` qualifiers everywhere."""
@@ -1304,8 +1421,7 @@ class XLSXPackage:
             table['range'][1] = indices_to_cell(
                 abs_row, table['start_indices'][1] + len(table['columns']) - 1
             )
-            root = self.trees[table['xml_path']].getroot()
-            root.set('ref', f"{table['range'][0]}:{table['range'][1]}")
+            self._write_table_ref(table)
 
         self.update_cell(
             table['sheet'], indices_to_cell(abs_row, abs_col), value=value, style_id=style_id
@@ -1540,9 +1656,7 @@ class XLSXPackage:
                 f"'{target_name}' above its header row"
             )
         table['range'][1] = indices_to_cell(new_end_r, end_c)
-        self.trees[table['xml_path']].getroot().set(
-            'ref', f"{table['range'][0]}:{table['range'][1]}"
-        )
+        self._write_table_ref(table)
         if add_rows > 0:
             self._resolve_collisions(target_name, table, axis=0)
 
@@ -1557,9 +1671,7 @@ class XLSXPackage:
                 f"columns of '{target_name}'"
             )
         table['range'][1] = indices_to_cell(end_r, new_end_c)
-        self.trees[table['xml_path']].getroot().set(
-            'ref', f"{table['range'][0]}:{table['range'][1]}"
-        )
+        self._write_table_ref(table)
         added = self._adjust_table_columns(table, add_cols, end_c)
         if add_cols > 0:
             self._resolve_collisions(target_name, table, axis=1)
@@ -1697,9 +1809,7 @@ class XLSXPackage:
             indices_to_cell(new_top, new_left),
             indices_to_cell(new_bottom, new_right),
         ]
-        self.trees[table['xml_path']].getroot().set(
-            'ref', f"{table['range'][0]}:{table['range'][1]}"
-        )
+        self._write_table_ref(table)
 
     def _rewrite_formulas(self, sheet_data, sheet_name, box, *, delta, axis):
         """Shift every reference into ``box`` by ``delta`` across all formulas."""
