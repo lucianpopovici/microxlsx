@@ -28,6 +28,13 @@ _WS_ORDER = (
     'webPublishItems', 'tableParts', 'extLst',
 )
 
+# Child element order of a <styleSheet> (ECMA-376 §18.8.39), for inserting
+# new children (e.g. <dxfs>) in a schema-valid position.
+_STYLES_ORDER = (
+    'numFmts', 'fonts', 'fills', 'borders', 'cellStyleXfs', 'cellXfs',
+    'cellStyles', 'dxfs', 'tableStyles', 'colors', 'extLst',
+)
+
 # Built-in number-format ids that render as dates/times (ECMA-376 §18.8.30).
 _BUILTIN_DATE_FMTS = frozenset(
     list(range(14, 23)) + list(range(27, 37)) + list(range(45, 48))
@@ -241,9 +248,13 @@ class XLSXPackage:
 
     def set_column_width(self, sheet_name, column, width):
         """Set a column's width. ``column`` is a letter (``"A"``) or 0-based int."""
+        col = self._single_col(self._sheet_root(sheet_name), self._col_index(column))
+        col.set('width', str(width))
+        col.set('customWidth', '1')
+
+    def _single_col(self, root, idx):
+        """Find or create a ``<col>`` covering exactly column ``idx`` (0-based)."""
         ns = self.NS['main']
-        root = self._sheet_root(sheet_name)
-        idx = self._col_index(column)
         num = str(idx + 1)  # <col> uses 1-based min/max
         cols = root.find(f"{{{ns}}}cols")
         if cols is None:
@@ -259,8 +270,7 @@ class XLSXPackage:
             col = ET.SubElement(cols, f"{{{ns}}}col")
             col.set('min', num)
             col.set('max', num)
-        col.set('width', str(width))
-        col.set('customWidth', '1')
+        return col
 
     def set_row_height(self, sheet_name, row, height):
         """Set a row's height. ``row`` is the 1-based row number."""
@@ -927,6 +937,250 @@ class XLSXPackage:
             prot.set('selectLockedCells', '0')
             prot.set('selectUnlockedCells', '0')
 
+    # pylint: disable=too-many-arguments,too-many-boolean-expressions
+    def add_data_validation(self, sheet_name, ref, kind, *, formula1=None,
+                            formula2=None, operator=None, allow_blank=True,
+                            prompt=None, prompt_title=None, error=None,
+                            error_title=None, show_dropdown=True):
+        """Add a data validation over ``ref`` (e.g. ``"A1:A10"`` or ``"A1 C2:C9"``).
+
+        ``kind`` is the validation type: ``"list"``, ``"whole"``, ``"decimal"``,
+        ``"date"``, ``"time"``, ``"textLength"``, or ``"custom"``. For a list,
+        pass ``formula1`` as an explicit comma list (``'"Yes,No,Maybe"'``,
+        quotes included) or a range/reference (``"$E$1:$E$3"``). For the bounded
+        kinds set ``operator`` (``"between"``, ``"notBetween"``, ``"equal"``,
+        ``"notEqual"``, ``"greaterThan"``, ``"lessThan"``,
+        ``"greaterThanOrEqual"``, ``"lessThanOrEqual"``) with ``formula1`` (and
+        ``formula2`` for the two-sided operators). Optional input (``prompt``)
+        and error messages are supported. Returns the created element.
+        """
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        parent = self._ws_ordered_child(root, 'dataValidations')
+        dv = ET.SubElement(parent, f"{{{ns}}}dataValidation")
+        dv.set('type', kind)
+        dv.set('sqref', ref)
+        if operator is not None:
+            dv.set('operator', operator)
+        dv.set('allowBlank', '1' if allow_blank else '0')
+        # In OOXML showDropDown="1" *hides* the in-cell dropdown; absent shows it.
+        if kind == 'list' and not show_dropdown:
+            dv.set('showDropDown', '1')
+        if prompt is not None or prompt_title is not None:
+            dv.set('showInputMessage', '1')
+            if prompt_title is not None:
+                dv.set('promptTitle', prompt_title)
+            if prompt is not None:
+                dv.set('prompt', prompt)
+        if error is not None or error_title is not None:
+            dv.set('showErrorMessage', '1')
+            if error_title is not None:
+                dv.set('errorTitle', error_title)
+            if error is not None:
+                dv.set('error', error)
+        if formula1 is not None:
+            ET.SubElement(dv, f"{{{ns}}}formula1").text = formula1
+        if formula2 is not None:
+            ET.SubElement(dv, f"{{{ns}}}formula2").text = formula2
+        parent.set('count', str(len(parent)))
+        return dv
+
+    # pylint: disable=too-many-arguments,too-many-branches,too-many-locals
+    def add_conditional_format(self, sheet_name, ref, rule_type, *,
+                               operator=None, formula=None, formulas=None,
+                               colors=None, color=None, dxf=None, priority=None):
+        """Add a conditional-formatting rule over ``ref``.
+
+        ``rule_type`` selects the rule and which options apply:
+
+        - ``"colorScale"``: ``colors`` = list of 2 or 3 ``"RRGGBB"`` (low→high).
+        - ``"dataBar"``: ``color`` = bar ``"RRGGBB"`` (default a blue).
+        - ``"cellIs"``: ``operator`` (e.g. ``"greaterThan"``, ``"between"``),
+          ``formula`` (str) or ``formulas`` (list, for ``"between"``), and
+          ``dxf`` = a differential-style id from :meth:`add_dxf`.
+        - ``"expression"``: ``formula`` (str) and ``dxf``.
+
+        Rules get descending priorities automatically (lower wins). Returns the
+        created ``cfRule`` element.
+        """
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        cf = ET.Element(f"{{{ns}}}conditionalFormatting")
+        cf.set('sqref', ref)
+        after = set(_WS_ORDER[_WS_ORDER.index('conditionalFormatting') + 1:])
+        self._insert_worksheet_child(root, cf, after)
+        if priority is None:
+            used = [int(r.get('priority')) for r in root.iter(f"{{{ns}}}cfRule")
+                    if r.get('priority')]
+            priority = max(used, default=0) + 1
+        rule = ET.SubElement(cf, f"{{{ns}}}cfRule")
+        rule.set('type', rule_type)
+        rule.set('priority', str(priority))
+        if rule_type == 'colorScale':
+            self._build_color_scale(rule, colors or ['FFF8696B', 'FF63BE7B'])
+        elif rule_type == 'dataBar':
+            self._build_data_bar(rule, color or '638EC6')
+        elif rule_type in ('cellIs', 'expression'):
+            if rule_type == 'cellIs' and operator is not None:
+                rule.set('operator', operator)
+            if dxf is not None:
+                rule.set('dxfId', str(dxf))
+            for text in (formulas or ([formula] if formula is not None else [])):
+                ET.SubElement(rule, f"{{{ns}}}formula").text = text
+        else:
+            raise ValueError(f"unsupported rule_type: {rule_type!r}")
+        return rule
+
+    def _build_color_scale(self, rule, stops):
+        """Populate a ``cfRule`` with a 2- or 3-stop ``<colorScale>``."""
+        ns = self.NS['main']
+        scale = ET.SubElement(rule, f"{{{ns}}}colorScale")
+        positions = ([('min', None), ('percentile', '50'), ('max', None)]
+                     if len(stops) == 3 else [('min', None), ('max', None)])
+        for kind, val in positions:
+            cfvo = ET.SubElement(scale, f"{{{ns}}}cfvo")
+            cfvo.set('type', kind)
+            if val is not None:
+                cfvo.set('val', val)
+        for stop in stops:
+            ET.SubElement(scale, f"{{{ns}}}color").set('rgb', self._argb(stop))
+
+    def _build_data_bar(self, rule, color):
+        """Populate a ``cfRule`` with a ``<dataBar>``."""
+        ns = self.NS['main']
+        data_bar = ET.SubElement(rule, f"{{{ns}}}dataBar")
+        ET.SubElement(data_bar, f"{{{ns}}}cfvo").set('type', 'min')
+        ET.SubElement(data_bar, f"{{{ns}}}cfvo").set('type', 'max')
+        ET.SubElement(data_bar, f"{{{ns}}}color").set('rgb', self._argb(color))
+
+    def add_dxf(self, *, font_color=None, fill_color=None, bold=False,
+                italic=False):
+        """Register a differential format for conditional formatting.
+
+        Returns a ``dxf`` id usable as :meth:`add_conditional_format`'s ``dxf``.
+        ``fill_color`` fills matching cells; ``font_color``/``bold``/``italic``
+        restyle their text. Requires an existing ``xl/styles.xml``.
+        """
+        ns = self.NS['main']
+        root = self._styles_tree().getroot()
+        dxfs = self._styles_ordered_child(root, 'dxfs')
+        dxf = ET.SubElement(dxfs, f"{{{ns}}}dxf")
+        if bold or italic or font_color is not None:
+            font = ET.SubElement(dxf, f"{{{ns}}}font")
+            if bold:
+                ET.SubElement(font, f"{{{ns}}}b")
+            if italic:
+                ET.SubElement(font, f"{{{ns}}}i")
+            if font_color is not None:
+                ET.SubElement(font, f"{{{ns}}}color").set('rgb', self._argb(font_color))
+        if fill_color is not None:
+            fill = ET.SubElement(dxf, f"{{{ns}}}fill")
+            pattern = ET.SubElement(fill, f"{{{ns}}}patternFill")
+            # dxf fills carry the color in bgColor (not fgColor).
+            ET.SubElement(pattern, f"{{{ns}}}bgColor").set('rgb', self._argb(fill_color))
+        dxfs.set('count', str(len(dxfs)))
+        return len(dxfs) - 1
+
+    def _styles_ordered_child(self, root, tag):
+        """Find or create a styles child ``tag`` in schema-valid order."""
+        ns = self.NS['main']
+        existing = root.find(f"{{{ns}}}{tag}")
+        if existing is not None:
+            return existing
+        element = ET.Element(f"{{{ns}}}{tag}")
+        following = set(_STYLES_ORDER[_STYLES_ORDER.index(tag) + 1:])
+        idx = len(root)
+        for i, child in enumerate(root):
+            if child.tag.rsplit('}', maxsplit=1)[-1] in following:
+                idx = i
+                break
+        root.insert(idx, element)
+        return element
+
+    def hide_rows(self, sheet_name, start, end=None):
+        """Hide rows ``start``..``end`` (1-based, inclusive; ``end`` defaults to ``start``)."""
+        ns = self.NS['main']
+        sheet_data = self._sheet_root(sheet_name).find(f"{{{ns}}}sheetData")
+        for row_num in range(start, (end if end is not None else start) + 1):
+            self._row_get_or_create(sheet_data, row_num).set('hidden', '1')
+
+    def hide_columns(self, sheet_name, start, end=None):
+        """Hide columns ``start``..``end`` (letters or 0-based ints, inclusive)."""
+        root = self._sheet_root(sheet_name)
+        first = self._col_index(start)
+        last = first if end is None else self._col_index(end)
+        for idx in range(first, last + 1):
+            self._single_col(root, idx).set('hidden', '1')
+
+    def group_rows(self, sheet_name, start, end, *, collapsed=False, hidden=False):
+        """Group rows ``start``..``end`` (1-based, inclusive) one outline level deeper.
+
+        ``hidden`` hides the grouped rows; ``collapsed`` also marks the summary
+        row just below the group collapsed (and hides the group).
+        """
+        ns = self.NS['main']
+        sheet_data = self._sheet_root(sheet_name).find(f"{{{ns}}}sheetData")
+        hidden = hidden or collapsed
+        for row_num in range(start, end + 1):
+            row = self._row_get_or_create(sheet_data, row_num)
+            row.set('outlineLevel', str(int(row.get('outlineLevel', '0')) + 1))
+            if hidden:
+                row.set('hidden', '1')
+        if collapsed:
+            self._row_get_or_create(sheet_data, end + 1).set('collapsed', '1')
+
+    def group_columns(self, sheet_name, start, end, *, collapsed=False, hidden=False):
+        """Group columns ``start``..``end`` (letters/ints) one outline level deeper.
+
+        ``hidden`` hides the grouped columns; ``collapsed`` also marks the
+        summary column just past the group collapsed (and hides the group).
+        """
+        root = self._sheet_root(sheet_name)
+        first = self._col_index(start)
+        last = self._col_index(end)
+        hidden = hidden or collapsed
+        for idx in range(first, last + 1):
+            col = self._single_col(root, idx)
+            col.set('outlineLevel', str(int(col.get('outlineLevel', '0')) + 1))
+            if hidden:
+                col.set('hidden', '1')
+        if collapsed:
+            self._single_col(root, last + 1).set('collapsed', '1')
+
+    def set_sheet_visibility(self, sheet_name, state):
+        """Set a sheet's visibility: ``"visible"``, ``"hidden"``, or ``"veryHidden"``.
+
+        Excel requires at least one visible sheet, so hiding the last visible
+        one raises ``ValueError``.
+        """
+        ns = self.NS['main']
+        if state not in ('visible', 'hidden', 'veryHidden'):
+            raise ValueError(f"invalid visibility state: {state!r}")
+        sheets = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}sheets")
+        entries = list(sheets.findall(f"{{{ns}}}sheet"))
+        target = next((s for s in entries if s.get('name') == sheet_name), None)
+        if target is None:
+            raise KeyError(sheet_name)
+        if state != 'visible' and not any(
+                s is not target and s.get('state', 'visible') == 'visible'
+                for s in entries):
+            raise ValueError("cannot hide the only visible sheet")
+        if state == 'visible':
+            target.attrib.pop('state', None)
+        else:
+            target.set('state', state)
+
+    def set_tab_color(self, sheet_name, color):
+        """Set a sheet's tab color (``"RRGGBB"``)."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        sheet_pr = self._ws_ordered_child(root, 'sheetPr')
+        tab = sheet_pr.find(f"{{{ns}}}tabColor")
+        if tab is None:
+            tab = ET.Element(f"{{{ns}}}tabColor")
+            sheet_pr.insert(0, tab)  # tabColor is the first child of sheetPr
+        tab.set('rgb', self._argb(color))
+
     def add_hyperlink(self, sheet_name, cell, url, *, tooltip=None):
         """Attach an external hyperlink (``url``) to a cell."""
         ns = self.NS['main']
@@ -938,6 +1192,22 @@ class XLSXPackage:
         link.set(f"{{{self.NS['r']}}}id", rid)
         if tooltip is not None:
             link.set('tooltip', tooltip)
+
+    def remove_hyperlink(self, sheet_name, cell):
+        """Remove the hyperlink anchored at ``cell`` (and its relationship)."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        container = root.find(f"{{{ns}}}hyperlinks")
+        if container is None:
+            return
+        for link in list(container.findall(f"{{{ns}}}hyperlink")):
+            if link.get('ref') == cell:
+                rid = link.get(f"{{{self.NS['r']}}}id")
+                container.remove(link)
+                if rid:
+                    self._remove_sheet_rel(sheet_name, rid)
+        if len(container) == 0:
+            root.remove(container)
 
     def add_image(self, sheet_name, cell, image, *, width=None, height=None):
         """Anchor an image at ``cell``. ``image`` is a path or raw bytes.
@@ -972,6 +1242,21 @@ class XLSXPackage:
         ET.SubElement(run, f"{{{ns}}}t").text = text
         self._append_comment_shape(sheet_name, cell)
 
+    def remove_comment(self, sheet_name, cell):
+        """Remove the comment anchored at ``cell`` (and its VML note shape)."""
+        ns = self.NS['main']
+        state = self._comment_state.get(sheet_name)
+        if state is None:
+            return
+        clist = state['tree'].getroot().find(f"{{{ns}}}commentList")
+        for comment in list(clist.findall(f"{{{ns}}}comment")):
+            if comment.get('ref') == cell:
+                clist.remove(comment)
+        target = cell_to_indices(cell)
+        if target in state['cells']:
+            state['cells'].remove(target)
+            self._added_bytes[state['vml_path']] = self._build_vml(state['cells'])
+
     def _add_sheet_rel(self, sheet_name, rel_type, target, *, external=False):
         """Append a relationship to a worksheet's rels; return its id."""
         rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[sheet_name]))
@@ -983,6 +1268,17 @@ class XLSXPackage:
         if external:
             rel.set('TargetMode', 'External')
         return rid
+
+    def _remove_sheet_rel(self, sheet_name, rid):
+        """Remove a worksheet relationship by id, if its rels part exists."""
+        rels_path = self._sheet_rels_path(self.sheet_map[sheet_name])
+        tree = self.trees.get(rels_path)
+        if tree is None:
+            return
+        root = tree.getroot()
+        for rel in root.findall(f"{{{self.REL_NS}}}Relationship"):
+            if rel.get('Id') == rid:
+                root.remove(rel)
 
     @staticmethod
     def _read_image(image):
@@ -1156,6 +1452,29 @@ class XLSXPackage:
             entry.set('localSheetId', str(order.index(sheet_name)))
         entry.text = ref
         return name
+
+    def remove_defined_name(self, name, *, sheet_name=None):
+        """Remove a defined name. Pass ``sheet_name`` for a sheet-scoped one.
+
+        Returns the number of entries removed.
+        """
+        ns = self.NS['main']
+        root = self.trees['xl/workbook.xml'].getroot()
+        names = root.find(f"{{{ns}}}definedNames")
+        if names is None:
+            return 0
+        local_id = None
+        if sheet_name is not None:
+            order = [s.get('name') for s in root.find(f"{{{ns}}}sheets")]
+            local_id = str(order.index(sheet_name))
+        removed = 0
+        for entry in list(names.findall(f"{{{ns}}}definedName")):
+            if entry.get('name') == name and entry.get('localSheetId') == local_id:
+                names.remove(entry)
+                removed += 1
+        if len(names) == 0:
+            root.remove(names)
+        return removed
 
     @staticmethod
     def _insert_worksheet_child(root, element, before_tags):

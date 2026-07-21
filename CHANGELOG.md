@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `add_data_validation(sheet, ref, kind, ...)` — author validations that
+  previously could only be shifted: list dropdowns (`formula1='"Yes,No"'` or a
+  range), `whole`/`decimal`/`date`/`time`/`textLength` bounds (with an
+  `operator` and one or two formulas), and `custom`. Optional input (`prompt`)
+  and error messages; `show_dropdown=False` hides the in-cell arrow.
+- `add_conditional_format(sheet, ref, rule_type, ...)` — author conditional
+  formatting: `colorScale` (2- or 3-stop), `dataBar`, and `cellIs` /
+  `expression` rules driven by a differential style. Rules get descending
+  priorities automatically.
+- `add_dxf(font_color=, fill_color=, bold=, italic=)` — register a differential
+  format (in a schema-ordered `<dxfs>`) and get back a `dxf` id for
+  `add_conditional_format`.
+- `hide_rows` / `hide_columns` and `group_rows` / `group_columns` (outline
+  levels, with optional `collapsed` summary), `set_sheet_visibility(sheet,
+  "hidden"|"veryHidden"|"visible")` (refuses to hide the last visible sheet),
+  and `set_tab_color(sheet, rgb)`.
+- Removal counterparts for symmetry: `remove_hyperlink(sheet, cell)` (also
+  drops its relationship), `remove_comment(sheet, cell)` (also removes its VML
+  note shape), and `remove_defined_name(name, sheet_name=)`.
+
 ## [0.2.0] - 2026-07-21
 
 ### Fixed
