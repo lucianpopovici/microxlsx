@@ -2155,3 +2155,121 @@ class TestInsertDeleteCols:
         pkg.update_cell("Sheet1", "B1", value=7)
         pkg.insert_cols("Sheet1", 0, 1)  # 0-based -> before column A
         assert pkg.get_cell("Sheet1", "C1") == 7
+
+
+class TestFreezePanes:
+    def _pane(self, pkg):
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        return root.find(f".//{{{NS}}}sheetViews/{{{NS}}}sheetView/{{{NS}}}pane")
+
+    def test_freeze_both(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.freeze_panes("Sheet1", "B2")
+        pane = self._pane(pkg)
+        assert pane.get("xSplit") == "1" and pane.get("ySplit") == "1"
+        assert pane.get("topLeftCell") == "B2" and pane.get("state") == "frozen"
+        assert pane.get("activePane") == "bottomRight"
+
+    def test_freeze_rows_only(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.freeze_panes("Sheet1", "A2")
+        pane = self._pane(pkg)
+        assert pane.get("xSplit") is None and pane.get("ySplit") == "1"
+        assert pane.get("activePane") == "bottomLeft"
+
+    def test_sheetviews_precedes_sheetdata(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.set_column_width("Sheet1", "A", 10)  # inserts <cols>
+        pkg.freeze_panes("Sheet1", "B2")
+        root = pkg.trees[pkg.sheet_map["Sheet1"]].getroot()
+        tags = [c.tag.split("}")[-1] for c in root]
+        assert tags.index("sheetViews") < tags.index("cols") < tags.index("sheetData")
+
+    def test_freeze_at_a1_is_noop(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.freeze_panes("Sheet1", "A1")
+        assert self._pane(pkg) is None
+
+
+class TestRenameSheet:
+    def test_workbook_and_map_updated(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.rename_sheet("Sheet1", "Report")
+        assert pkg.sheet_names() == ["Report"]
+        sheets = pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}sheets")
+        assert sheets[0].get("name") == "Report"
+
+    def test_table_sheet_refs_updated(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.rename_sheet("Sheet1", "Report")
+        assert pkg.table_map["Top"]["sheet"] == "Report"
+
+    def test_formula_qualifiers_rewritten(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "Z1", formula="=Sheet1!A1+Sheet2!A1")
+        pkg.rename_sheet("Sheet1", "Data")
+        root = pkg.trees[pkg.sheet_map["Data"]].getroot()
+        cell = root.find(f".//{{{NS}}}c[@r='Z1']")
+        assert cell.find(f"{{{NS}}}f").text == "Data!A1+Sheet2!A1"
+
+    def test_defined_name_qualifier_rewritten(self, tmp_path):
+        pkg = XLSXPackage(make_named_range_xlsx(tmp_path))
+        pkg.rename_sheet("Sheet1", "Data")
+        names = {n.get("name"): n.text
+                 for n in pkg.trees["xl/workbook.xml"].getroot()
+                 .find(f"{{{NS}}}definedNames")}
+        assert names["BottomData"] == "Data!$A$5:$A$7"
+        assert names["OtherSheet"] == "Sheet2!$A$5:$A$7"
+
+    def test_quotes_name_with_space(self, tmp_path):
+        pkg = XLSXPackage(make_formula_xlsx(tmp_path))
+        pkg.update_cell("Sheet1", "Z1", formula="=Sheet1!A1")
+        pkg.rename_sheet("Sheet1", "My Data")
+        root = pkg.trees[pkg.sheet_map["My Data"]].getroot()
+        assert root.find(f".//{{{NS}}}c[@r='Z1']/{{{NS}}}f").text == "'My Data'!A1"
+
+    def test_missing_and_duplicate_guards(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        with pytest.raises(KeyError):
+            pkg.rename_sheet("Nope", "X")
+
+
+class TestAddDefinedName:
+    def _names(self, pkg):
+        dn = pkg.trees["xl/workbook.xml"].getroot().find(f"{{{NS}}}definedNames")
+        return {n.get("name"): n for n in dn.findall(f"{{{NS}}}definedName")}
+
+    def test_global_name_added(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_defined_name("TaxRate", "Sheet1!$B$2")
+        entry = self._names(pkg)["TaxRate"]
+        assert entry.text == "Sheet1!$B$2"
+        assert entry.get("localSheetId") is None
+
+    def test_scoped_name_gets_local_sheet_id(self, tmp_path):
+        pkg = XLSXPackage(make_multi_table_xlsx(tmp_path))
+        pkg.add_defined_name("Local", "Sheet1!$A$1", sheet_name="Sheet1")
+        assert self._names(pkg)["Local"].get("localSheetId") == "0"
+
+    def test_definednames_after_sheets(self, tmp_path):
+        pkg = XLSXPackage(make_xlsx(tmp_path))
+        pkg.add_defined_name("N", "Sheet1!$A$1")
+        root = pkg.trees["xl/workbook.xml"].getroot()
+        tags = [c.tag.split("}")[-1] for c in root]
+        assert tags.index("definedNames") == tags.index("sheets") + 1
+
+
+class TestAddTableStyle:
+    def test_default_style_applied(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T", "D1:E2", ["x", "y"])
+        root = pkg.trees["xl/tables/table2.xml"].getroot()
+        style = root.find(f"{{{NS}}}tableStyleInfo")
+        assert style.get("name") == "TableStyleMedium2"
+        assert style.get("showRowStripes") == "1"
+
+    def test_style_none_omits(self, tmp_path):
+        pkg = XLSXPackage(make_opc_xlsx(tmp_path))
+        pkg.add_table("Sheet1", "T", "D1:E2", ["x", "y"], style_name=None)
+        root = pkg.trees["xl/tables/table2.xml"].getroot()
+        assert root.find(f"{{{NS}}}tableStyleInfo") is None

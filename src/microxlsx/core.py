@@ -286,19 +286,28 @@ class XLSXPackage:
             self._drop_table_part(table)
         del self.sheet_map[name]
 
-    # pylint: disable=too-many-locals
-    def add_table(self, sheet_name, name, ref, columns):
-        """Create a table over ``ref`` on a sheet with the given column names."""
+    # pylint: disable=too-many-locals,too-many-arguments
+    def add_table(self, sheet_name, name, ref, columns, *,
+                  style_name="TableStyleMedium2"):
+        """Create a table over ``ref`` on a sheet with the given column names.
+
+        ``style_name`` applies a built-in table style with banded rows (pass
+        ``None`` for an unstyled table).
+        """
         ns = self.NS['main']
         if name in self.table_map:
             raise ValueError(f"table '{name}' already exists")
         part = f"xl/tables/table{self._next_part_number('xl/tables/table')}.xml"
         cols = ''.join(f'<tableColumn id="{i + 1}" name="{c}"/>'
                        for i, c in enumerate(columns))
+        style = (f'<tableStyleInfo name="{style_name}" showFirstColumn="0"'
+                 f' showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>'
+                 if style_name else '')
         self.trees[part] = ET.ElementTree(ET.fromstring(
             f'<table xmlns="{ns}" id="{self._next_table_id()}" name="{name}"'
             f' displayName="{name}" ref="{ref}">'
-            f'<tableColumns count="{len(columns)}">{cols}</tableColumns></table>'))
+            f'<tableColumns count="{len(columns)}">{cols}</tableColumns>'
+            f'{style}</table>'))
         rels = self._get_or_create_rels(self._sheet_rels_path(self.sheet_map[sheet_name]))
         rid = self._next_rid(rels.getroot())
         rel = ET.SubElement(rels.getroot(), f"{{{self.REL_NS}}}Relationship")
@@ -782,6 +791,114 @@ class XLSXPackage:
         plain = re.match(r"([A-Z]+)([0-9]+)", indices_to_cell(*rc))
         return (f"{markers.group(1)}{plain.group(1)}"
                 f"{markers.group(2)}{plain.group(2)}")
+
+    def freeze_panes(self, sheet_name, cell):
+        """Freeze rows above and columns left of ``cell`` (e.g. ``"B2"``)."""
+        ns = self.NS['main']
+        root = self._sheet_root(sheet_name)
+        row, col = cell_to_indices(cell)
+        views = root.find(f"{{{ns}}}sheetViews")
+        if views is None:
+            views = ET.Element(f"{{{ns}}}sheetViews")
+            self._insert_worksheet_child(
+                root, views, {'sheetFormatPr', 'cols', 'sheetData'})
+        view = views.find(f"{{{ns}}}sheetView")
+        if view is None:
+            view = ET.SubElement(views, f"{{{ns}}}sheetView")
+            view.set('workbookViewId', '0')
+        for tag in ('pane', 'selection'):
+            for stale in view.findall(f"{{{ns}}}{tag}"):
+                view.remove(stale)
+        if row == 0 and col == 0:
+            return  # nothing to freeze
+        pane = ET.Element(f"{{{ns}}}pane")
+        if col > 0:
+            pane.set('xSplit', str(col))
+        if row > 0:
+            pane.set('ySplit', str(row))
+        pane.set('topLeftCell', cell)
+        pane.set('activePane',
+                 'bottomRight' if row and col else
+                 'bottomLeft' if row else 'topRight')
+        pane.set('state', 'frozen')
+        view.insert(0, pane)  # pane must precede any selection
+
+    def rename_sheet(self, old_name, new_name):
+        """Rename a sheet, rewriting ``OldName!`` qualifiers everywhere."""
+        ns = self.NS['main']
+        if old_name not in self.sheet_map:
+            raise KeyError(old_name)
+        if new_name in self.sheet_map:
+            raise ValueError(f"sheet '{new_name}' already exists")
+        sheets = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}sheets")
+        next(s for s in sheets if s.get('name') == old_name).set('name', new_name)
+        self.sheet_map[new_name] = self.sheet_map.pop(old_name)
+        for meta in self.table_map.values():
+            if meta['sheet'] == old_name:
+                meta['sheet'] = new_name
+        self._rename_sheet_refs(old_name, new_name)
+
+    def add_defined_name(self, name, ref, *, sheet_name=None):
+        """Create a workbook defined name pointing at ``ref``.
+
+        Pass ``sheet_name`` to scope the name to that sheet (``localSheetId``);
+        omit for a workbook-global name.
+        """
+        ns = self.NS['main']
+        root = self.trees['xl/workbook.xml'].getroot()
+        names = root.find(f"{{{ns}}}definedNames")
+        if names is None:
+            names = ET.Element(f"{{{ns}}}definedNames")
+            self._insert_workbook_child(root, names)
+        entry = ET.SubElement(names, f"{{{ns}}}definedName")
+        entry.set('name', name)
+        if sheet_name is not None:
+            order = [s.get('name')
+                     for s in root.find(f"{{{ns}}}sheets")]
+            entry.set('localSheetId', str(order.index(sheet_name)))
+        entry.text = ref
+        return name
+
+    @staticmethod
+    def _insert_worksheet_child(root, element, before_tags):
+        """Insert ``element`` before the first child whose tag is in ``before_tags``."""
+        idx = len(root)
+        for i, child in enumerate(root):
+            if child.tag.rsplit('}', maxsplit=1)[-1] in before_tags:
+                idx = i
+                break
+        root.insert(idx, element)
+
+    def _insert_workbook_child(self, root, element):
+        """Insert a workbook child (definedNames) just after ``<sheets>``."""
+        ns = self.NS['main']
+        sheets = root.find(f"{{{ns}}}sheets")
+        idx = list(root).index(sheets) + 1 if sheets is not None else len(root)
+        root.insert(idx, element)
+
+    def _rename_sheet_refs(self, old_name, new_name):
+        """Rewrite ``OldName!`` / ``'Old Name'!`` qualifiers across the workbook."""
+        ns = self.NS['main']
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_])(?:'" + re.escape(old_name) + r"'|"
+            + re.escape(old_name) + r")!")
+        replacement = f"{self._quote_sheet_name(new_name)}!"
+        for sheet_path in list(self.sheet_map.values()):
+            root = self._sheet_root(sheet_path)
+            for f_node in root.iter(f"{{{ns}}}f"):
+                if f_node.text:
+                    f_node.text = pattern.sub(replacement, f_node.text)
+        names = self.trees['xl/workbook.xml'].getroot().find(f"{{{ns}}}definedNames")
+        for entry in (names.findall(f"{{{ns}}}definedName") if names is not None else []):
+            if entry.text:
+                entry.text = pattern.sub(replacement, entry.text)
+
+    @staticmethod
+    def _quote_sheet_name(name):
+        """Quote a sheet name for use as a formula qualifier when needed."""
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", name):
+            return name
+        return "'" + name.replace("'", "''") + "'"
 
     def merge_cells(self, sheet_name, cell_range):
         """Adds a merge rule to the worksheet."""

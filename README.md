@@ -78,6 +78,11 @@ pkg.remove_sheet("Scratch")
 pkg.insert_rows("Sheet1", 4, count=2)   # everything below shifts down
 pkg.delete_cols("Sheet1", "F")          # refs into F become #REF!, rest shift
 
+# Finishing touches
+pkg.freeze_panes("Sheet1", "B2")                 # freeze header row + first col
+pkg.rename_sheet("Sheet1", "Summary")            # rewrites Sheet1! qualifiers
+pkg.add_defined_name("TaxRate", "Summary!$B$2")  # workbook-global named range
+
 # Reuse or inspect existing styles
 tmpl = pkg.get_cell_style("Sheet1", "B2")            # raw id, always faithful
 pkg.update_cell("Sheet1", "B10", value=99, style_id=tmpl)
